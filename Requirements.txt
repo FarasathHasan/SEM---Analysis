@@ -1,0 +1,45 @@
+# ============================================================
+# ULMIF — Urban Luminosity Morphology Integration Framework
+# Python dependencies
+# Tested on Python 3.10 / 3.11 (Windows, Linux, macOS)
+# ============================================================
+
+# ---- Core scientific stack ----
+numpy>=1.24,<2.0
+pandas>=2.0
+scipy>=1.11
+
+# ---- Geospatial / raster I/O ----
+rasterio>=1.3
+# Note (Windows): install rasterio via conda-forge or the Gohlke wheel to
+# avoid GDAL build issues:
+#   conda install -c conda-forge rasterio
+# or
+#   pip install rasterio‑<version>‑cp<python>‑cp<python>‑win_amd64.whl
+
+# ---- Machine learning ----
+scikit-learn>=1.3
+
+# ---- Image analysis ----
+scikit-image>=0.21
+PyWavelets>=1.4
+
+# ---- Deep learning (VAE in sprawl_index.py) ----
+# CPU-only (sufficient for most cities):
+torch>=2.0
+# For GPU support, follow https://pytorch.org/get-started/locally/
+# and install the CUDA-enabled wheel instead.
+
+# ---- Spatial computation ----
+# scipy.spatial (cKDTree, KDTree) — included in scipy above
+# scipy.ndimage — included in scipy above
+
+# ---- Progress / utilities ----
+tqdm>=4.65
+
+# ---- Plotting (SD analysis figures) ----
+matplotlib>=3.7
+
+# ---- Optional: faster KDTree on large rasters ----
+# Install only if needed; not required for correctness
+# scikit-learn already provides an efficient BallTree/KDTree via sklearn.neighbors
