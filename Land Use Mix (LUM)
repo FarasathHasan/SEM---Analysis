@@ -8,9 +8,7 @@ from datetime import datetime
 
 warnings.filterwarnings("ignore")
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+
 INPUT_FILE_2017 = "Processed data/2017_cleaned.tif"
 INPUT_FILE_2024 = "Processed data/2024_cleaned.tif"
 OUTPUT_DIR = "outputs_lum"
@@ -18,9 +16,7 @@ CITY_NAME = "your_city_name"   # <-- CHANGE EACH TIME
 
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-# =============================================================================
-# DATA‑DRIVEN WINDOW SIZE (same as original)
-# =============================================================================
+
 def learn_window_size(data, cell_size_m, nodata_value=None):
     valid = (data > 0)
     if nodata_value is not None:
@@ -56,9 +52,6 @@ def learn_window_size(data, cell_size_m, nodata_value=None):
     print(f"  Learned window: {window_px} px = {window_px * cell_size_m:.0f} m")
     return window_px
 
-# =============================================================================
-# SHEI CALCULATION (unchanged, robust edge handling)
-# =============================================================================
 def calculate_shei(raster_data, cell_size_m, nodata_value=None, window_size=None):
     if window_size is None:
         window_size = learn_window_size(raster_data, cell_size_m, nodata_value)
@@ -105,9 +98,7 @@ def calculate_shei(raster_data, cell_size_m, nodata_value=None, window_size=None
 
     return entropy_map, window_size
 
-# =============================================================================
-# MAIN ANALYSIS
-# =============================================================================
+
 def main():
     print("=" * 70)
     print("LUM COMPOSITE – NEW GROWTH FOCUS")
