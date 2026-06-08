@@ -1,0 +1,857 @@
+#!/usr/bin/env python3
+import warnings
+warnings.filterwarnings("ignore")
+
+from pathlib import Path
+from datetime import datetime
+from itertools import combinations
+import json
+
+import numpy as np
+import pandas as pd
+import rasterio
+from scipy.ndimage import distance_transform_edt, gaussian_filter, binary_dilation, binary_erosion
+from scipy.stats import spearmanr
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+
+
+print("=" * 80)
+print("CORRECTED FULLY LEARNED GROWTH MAGNITUDE ANALYSIS")
+print("=" * 80)
+print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+output_dir = Path("outputs_growth_magnitude")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+def to_jsonable(obj):
+    """Recursively convert numpy types/arrays to JSON-safe Python objects."""
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.integer, np.int64, np.int32)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float64, np.float32)):
+        return float(obj)
+    if isinstance(obj, dict):
+        return {str(k): to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return obj
+
+
+class Config:
+    CELL_SIZE = 10
+    PIXEL_AREA_M2 = CELL_SIZE * CELL_SIZE
+    PIXEL_AREA_HA = PIXEL_AREA_M2 / 10000.0
+    NODATA_VALUE = -9999.0
+
+    MAX_ABSOLUTE_GROWTH = None
+    MAX_RELATIVE_GROWTH = None
+
+    MCDA_WEIGHTS = None
+    SPATIAL_KERNEL_SIGMA = None
+
+    YEARS = {2017: 2017, 2024: 2024}
+    INTERVALS = [
+        ("2017-2024", 2017, 2024, 7)
+    ]
+
+
+class ImprovedWeightLearner:
+    def __init__(self):
+        self.weights = {}
+        self.parameters = {}
+
+    def learn_mcda_weights(self, absolute_values, relative_values):
+        print("\n" + "=" * 80)
+        print("LEARNING MCDA WEIGHTS (PCA + Entropy + CV Ensemble)")
+        print("=" * 80)
+
+        abs_values = np.abs(np.asarray(absolute_values, dtype=float))
+        rel_values = np.abs(np.asarray(relative_values, dtype=float))
+
+        if len(abs_values) == 1:
+            print("\n⚠ Single time interval detected - using simplified weight learning")
+
+            abs_val = float(abs_values[0])
+            rel_val = float(rel_values[0])
+
+            total = abs_val + rel_val
+            if total <= 0:
+                final_w = np.array([0.5, 0.5], dtype=float)
+            else:
+                final_w = np.array([abs_val / total, rel_val / total], dtype=float)
+
+            self.weights["mcda"] = {
+                "absolute": float(final_w[0]),
+                "relative": float(final_w[1]),
+            }
+
+            print("\n📊 MCDA Weights (simplified for single interval):")
+            print(f"   ✓ FINAL: Abs={final_w[0]:.4f}, Rel={final_w[1]:.4f}")
+            return self.weights["mcda"]
+
+        data_matrix = np.column_stack([abs_values, rel_values])
+
+        pca_w = self._pca_weights(data_matrix)
+        ent_w = self._entropy_weights(data_matrix)
+        cv_w = self._cv_weights(data_matrix)
+
+        final_w = (pca_w + ent_w + cv_w) / 3.0
+        final_w = final_w / final_w.sum() if final_w.sum() > 0 else np.array([0.5, 0.5])
+
+        self.weights["mcda"] = {
+            "absolute": float(final_w[0]),
+            "relative": float(final_w[1]),
+        }
+
+        print("\n📊 MCDA Weights:")
+        print(f"   PCA:     Abs={pca_w[0]:.4f}, Rel={pca_w[1]:.4f}")
+        print(f"   Entropy: Abs={ent_w[0]:.4f}, Rel={ent_w[1]:.4f}")
+        print(f"   CV:      Abs={cv_w[0]:.4f}, Rel={cv_w[1]:.4f}")
+        print(f"\n   ✓ FINAL: Abs={final_w[0]:.4f}, Rel={final_w[1]:.4f}")
+
+        return self.weights["mcda"]
+
+    def _pca_weights(self, data):
+        if data.shape[0] < 2:
+            return np.array([0.5, 0.5], dtype=float)
+
+        scaler = StandardScaler()
+        data_scaled = scaler.fit_transform(data)
+
+        n_comp = min(2, data.shape[0], data.shape[1])
+        pca = PCA(n_components=n_comp)
+        pca.fit(data_scaled)
+
+        loadings = np.abs(pca.components_[0])
+        s = loadings.sum()
+        return loadings / s if s > 0 else np.array([0.5, 0.5], dtype=float)
+
+    def _entropy_weights(self, data):
+        eps = 1e-12
+        entropy_scores = []
+
+        for col in range(data.shape[1]):
+            col_data = data[:, col]
+            if np.allclose(col_data.max(), col_data.min()):
+                entropy_scores.append(0.0)
+                continue
+
+            norm = (col_data - col_data.min()) / (col_data.max() - col_data.min() + eps)
+            norm = norm + eps
+            p = norm / norm.sum()
+
+            ent = -np.sum(p * np.log(p))
+            ent_norm = ent / np.log(len(p)) if len(p) > 1 else 1.0
+            info = 1.0 - ent_norm
+            entropy_scores.append(max(info, 0.0))
+
+        entropy_scores = np.asarray(entropy_scores, dtype=float)
+        s = entropy_scores.sum()
+        return entropy_scores / s if s > 0 else np.array([0.5, 0.5], dtype=float)
+
+    def _cv_weights(self, data):
+        weights = []
+        for col in range(data.shape[1]):
+            col_data = data[:, col]
+            mean = np.mean(col_data)
+            std = np.std(col_data)
+            cv = std / (abs(mean) + 1e-12) if std > 0 else 0.0
+            weights.append(cv)
+
+        weights = np.asarray(weights, dtype=float)
+        s = weights.sum()
+        return weights / s if s > 0 else np.array([0.5, 0.5], dtype=float)
+
+    def learn_spatial_system(self, new_urban_mask, urban_t0_mask):
+        print("\n" + "=" * 80)
+        print("LEARNING SPATIAL SYSTEM (Robust Data-Driven Weighting)")
+        print("=" * 80)
+
+        if np.sum(new_urban_mask) == 0:
+            return self._default_params()
+
+        print("\n   Computing spatial components...")
+
+        dist_comp = self._compute_distance_component(new_urban_mask, urban_t0_mask)
+        dens_comp = self._compute_density_component(new_urban_mask)
+        edge_comp = self._compute_edge_component(new_urban_mask, urban_t0_mask)
+
+        dist_std = self._standardize_component(dist_comp, new_urban_mask)
+        dens_std = self._standardize_component(dens_comp, new_urban_mask)
+        edge_std = self._standardize_component(edge_comp, new_urban_mask)
+
+        weights = self._balanced_component_weights(dist_std, dens_std, edge_std, new_urban_mask)
+
+        modifier_params = self._learn_modifier_parameters(
+            dist_std, dens_std, edge_std, weights, new_urban_mask
+        )
+
+        return {
+            "weights": weights,
+            "modifier_params": modifier_params,
+            "components": {
+                "distance": dist_std,
+                "density": dens_std,
+                "edge": edge_std,
+            }
+        }
+
+    def _compute_distance_component(self, new_urban, urban_t0):
+        print("     1. Distance from urban core...")
+
+        dist = distance_transform_edt(~urban_t0.astype(bool))
+        new_dist = dist[new_urban]
+
+        if len(new_dist) > 0 and np.max(new_dist) > 0:
+            dist_norm = dist / np.max(new_dist)
+            comp = 1.0 - dist_norm
+        else:
+            comp = np.ones_like(dist, dtype=float)
+
+        stats = comp[new_urban]
+        print(f"        Range: [{np.min(stats):.3f}, {np.max(stats):.3f}], "
+              f"Mean: {np.mean(stats):.3f}, Std: {np.std(stats):.3f}")
+        return comp
+
+    def _compute_density_component(self, new_urban):
+        print("     2. Local growth density...")
+
+        sigma = self._learn_kernel_size(new_urban)
+        print(f"        Learned kernel: {sigma:.2f} pixels")
+        Config.SPATIAL_KERNEL_SIGMA = sigma
+
+        dens = gaussian_filter(new_urban.astype(float), sigma=sigma)
+        new_dens = dens[new_urban]
+
+        if len(new_dens) > 0 and np.max(new_dens) > 0:
+            comp = dens / np.max(new_dens)
+        else:
+            comp = np.ones_like(dens, dtype=float)
+
+        stats = comp[new_urban]
+        print(f"        Range: [{np.min(stats):.3f}, {np.max(stats):.3f}], "
+              f"Mean: {np.mean(stats):.3f}, Std: {np.std(stats):.3f}")
+        return comp
+
+    def _compute_edge_component(self, new_urban, urban_t0):
+        print("     3. Edge proximity...")
+
+        dilated = binary_dilation(urban_t0, iterations=2)
+        eroded = binary_erosion(urban_t0, iterations=2)
+        edges = dilated & ~eroded
+
+        edge_dist = distance_transform_edt(~edges)
+        new_edge = edge_dist[new_urban]
+
+        if len(new_edge) > 0 and np.max(new_edge) > 0:
+            edge_norm = edge_dist / np.max(new_edge)
+            comp = 1.0 - edge_norm
+        else:
+            comp = np.ones_like(edge_dist, dtype=float)
+
+        stats = comp[new_urban]
+        print(f"        Range: [{np.min(stats):.3f}, {np.max(stats):.3f}], "
+              f"Mean: {np.mean(stats):.3f}, Std: {np.std(stats):.3f}")
+        return comp
+
+    def _standardize_component(self, component, mask):
+        values = component[mask]
+
+        if len(values) == 0:
+            return np.ones_like(component, dtype=float) * 0.5
+
+        mean = np.mean(values)
+        std = np.std(values)
+
+        if std <= 0:
+            return np.ones_like(component, dtype=float) * 0.5
+
+        z = (component - mean) / std
+        z_vals = z[mask]
+        p2 = np.percentile(z_vals, 2)
+        p98 = np.percentile(z_vals, 98)
+
+        if p98 > p2:
+            scaled = (z - p2) / (p98 - p2)
+            scaled = np.clip(scaled, 0.0, 1.0)
+        else:
+            scaled = np.ones_like(component, dtype=float) * 0.5
+
+        return scaled
+
+    def _balanced_component_weights(self, comp1, comp2, comp3, mask):
+        print("\n   Learning weights via variation + redundancy analysis...")
+
+        c1 = comp1[mask].astype(float)
+        c2 = comp2[mask].astype(float)
+        c3 = comp3[mask].astype(float)
+
+        infos = np.array([
+            self._robust_cv(c1),
+            self._robust_cv(c2),
+            self._robust_cv(c3),
+        ], dtype=float)
+
+        comps = [c1, c2, c3]
+        corr = np.eye(3, dtype=float)
+
+        for i, j in combinations(range(3), 2):
+            a = comps[i]
+            b = comps[j]
+            if np.std(a) > 0 and np.std(b) > 0:
+                r, _ = spearmanr(a, b)
+                r = 0.0 if np.isnan(r) else abs(float(r))
+            else:
+                r = 0.0
+            corr[i, j] = r
+            corr[j, i] = r
+
+        redundancy = np.array([
+            1.0 - np.mean(corr[0, [1, 2]]),
+            1.0 - np.mean(corr[1, [0, 2]]),
+            1.0 - np.mean(corr[2, [0, 1]]),
+        ], dtype=float)
+
+        redundancy = np.clip(redundancy, 0.0, 1.0)
+        raw = infos * redundancy
+
+        print(f"     Variation scores (CV):  Distance={infos[0]:.4f}, Density={infos[1]:.4f}, Edge={infos[2]:.4f}")
+        print(f"     Redundancy penalties:   Distance={redundancy[0]:.4f}, Density={redundancy[1]:.4f}, Edge={redundancy[2]:.4f}")
+
+        if raw.sum() <= 0:
+            w = np.array([1/3, 1/3, 1/3], dtype=float)
+        else:
+            w = raw / raw.sum()
+
+        weights = {
+            "distance": float(w[0]),
+            "density": float(w[1]),
+            "edge": float(w[2]),
+        }
+
+        print("\n   ✓ LEARNED spatial weights:")
+        print(f"     Distance: {weights['distance']:.4f}")
+        print(f"     Density:  {weights['density']:.4f}")
+        print(f"     Edge:     {weights['edge']:.4f}")
+
+        return weights
+
+    def _robust_cv(self, x):
+        x = np.asarray(x, dtype=float)
+        if x.size == 0:
+            return 0.0
+        mean = np.mean(x)
+        std = np.std(x)
+        if std <= 0:
+            return 0.0
+        return float(std / (abs(mean) + 1e-12))
+
+    def _learn_modifier_parameters(self, c1, c2, c3, weights, mask):
+        print("\n   Learning modifier scaling parameters...")
+
+        combined = (
+            weights["distance"] * c1 +
+            weights["density"] * c2 +
+            weights["edge"] * c3
+        )
+
+        values = combined[mask].astype(float)
+
+        if len(values) == 0:
+            return {
+                "mean": 1.0,
+                "std": 0.0,
+                "median": 1.0,
+                "min": 1.0,
+                "max": 1.0,
+            }
+
+        mean = float(np.mean(values))
+        std = float(np.std(values))
+        median = float(np.median(values))
+        p5 = float(np.percentile(values, 5))
+        p95 = float(np.percentile(values, 95))
+
+        if p95 <= p5:
+            p5, p95 = 0.5, 1.0
+
+        params = {
+            "mean": mean,
+            "std": std,
+            "median": median,
+            "min": p5,
+            "max": p95,
+        }
+
+        print(f"     Combined modifier statistics:")
+        print(f"       Range [5-95%]: [{p5:.4f}, {p95:.4f}]")
+        print(f"       Mean: {mean:.4f}, Median: {median:.4f}, Std: {std:.4f}")
+        print(f"\n   ✓ LEARNED scaling range: [{p5:.4f}, {p95:.4f}]")
+
+        return params
+
+    def _learn_kernel_size(self, growth_pattern):
+        lags = [1, 2, 3, 5, 7, 10, 15, 20]
+        autocorrs = []
+
+        gp = growth_pattern.astype(float)
+
+        for lag in lags:
+            sh = np.zeros_like(gp)
+            sv = np.zeros_like(gp)
+
+            sh[:, lag:] = gp[:, :-lag]
+            sv[lag:, :] = gp[:-lag, :]
+
+            vh = (gp > 0) | (sh > 0)
+            vv = (gp > 0) | (sv > 0)
+
+            ch = 0.0
+            cv = 0.0
+
+            if np.sum(vh) > 100:
+                x = gp[vh].ravel()
+                y = sh[vh].ravel()
+                if np.std(x) > 0 and np.std(y) > 0:
+                    ch = np.corrcoef(x, y)[0, 1]
+                    ch = 0.0 if np.isnan(ch) else float(ch)
+
+            if np.sum(vv) > 100:
+                x = gp[vv].ravel()
+                y = sv[vv].ravel()
+                if np.std(x) > 0 and np.std(y) > 0:
+                    cv_ = np.corrcoef(x, y)[0, 1]
+                    cv = 0.0 if np.isnan(cv_) else float(cv_)
+
+            avg = (abs(ch) + abs(cv)) / 2.0
+            autocorrs.append(avg)
+
+        autocorrs = np.asarray(autocorrs, dtype=float)
+
+        if len(autocorrs) == 0 or np.max(autocorrs) <= 0:
+            return 3.0
+
+        threshold = np.mean(autocorrs) + 0.5 * np.std(autocorrs)
+        threshold = float(np.clip(threshold, 0.1, 0.9))
+
+        sig = autocorrs > threshold
+
+        if np.any(sig):
+            last = np.where(sig)[0][-1]
+            rng = lags[last]
+        else:
+            rng = lags[int(np.argmax(autocorrs))]
+
+        sigma = rng / 3.0
+        sigma = float(np.clip(sigma, 1.0, 10.0))
+        return sigma
+
+    def _default_params(self):
+        return {
+            "weights": {"distance": 1/3, "density": 1/3, "edge": 1/3},
+            "modifier_params": {"min": 0.5, "max": 1.5, "mean": 1.0, "std": 0.3},
+            "components": None
+        }
+
+
+class UrbanDataLoader:
+    def __init__(self, base_path="Processed data"):
+        self.base_path = Path(base_path)
+        self.data = {}
+        self.metadata = {}
+
+    def load_data(self):
+        print("=" * 80)
+        print("LOADING LAND USE DATA")
+        print("=" * 80)
+        print(f"Classes: 1=Urban, 2=Vegetation, 3=Water, 4=Agriculture")
+        print(f"Resolution: {Config.CELL_SIZE}m, Pixel area: {Config.PIXEL_AREA_HA} ha\n")
+
+        for year in [2017, 2024]:
+            filepath = self._find_file(f"{year}_cleaned.tif")
+            if not filepath:
+                raise FileNotFoundError(
+                    f"Could not find {year}_cleaned.tif (or clipped variant) in {self.base_path}"
+                )
+
+            print(f"Loading {year}...")
+            with rasterio.open(filepath) as src:
+                data = src.read(1)
+
+                if year == 2017:
+                    self.metadata = {
+                        "transform": src.transform,
+                        "crs": src.crs,
+                        "shape": data.shape,
+                        "nodata": src.nodata,
+                    }
+
+                valid = ~self._detect_nodata(data, src.nodata)
+                self.data[year] = {
+                    "raw": data,
+                    "urban": (data == 1).astype(np.uint8),
+                    "valid_mask": valid,
+                }
+
+                urb_pix = int(np.sum(self.data[year]["urban"]))
+                urb_ha = urb_pix * Config.PIXEL_AREA_HA
+                valid_pix = int(np.sum(valid))
+
+                print(f"  ✓ {year}: {valid_pix:,} valid pixels, {urb_pix:,} urban ({urb_ha:,.2f} ha)")
+
+        print("\n✓ All data loaded\n")
+        return self.data, self.metadata
+
+    def _find_file(self, filename):
+        candidates = [
+            self.base_path / filename,
+            self.base_path / filename.replace(".tif", "_clipped.tif"),
+            self.base_path / filename.replace(".tif", " clipped.tif"),
+        ]
+        for c in candidates:
+            if c.exists():
+                return c
+        return None
+
+    def _detect_nodata(self, data, src_nodata=None):
+        mask = (
+            np.isnan(data) |
+            np.isinf(data) |
+            (data < -1e10) |
+            (data > 1e10) |
+            (data == -9999) |
+            (data == -32767)
+        )
+        if src_nodata is not None:
+            mask = mask | (data == src_nodata)
+        return mask
+
+
+class ImprovedGMCalculator:
+    def __init__(self, data):
+        self.data = data
+        self.results = {}
+        self.learner = ImprovedWeightLearner()
+        self.learned_params = {}      # JSON-safe summary only
+        self.spatial_system = None    # Full in-memory spatial system for export
+
+    def calculate_all_metrics(self):
+        print("=" * 80)
+        print("CALCULATING GM WITH CORRECTED LEARNED PARAMETERS")
+        print("=" * 80)
+
+        # First pass: collect gross growth values only.
+        gross_abs_growth = []
+        gross_rel_growth = []
+
+        for _, y0, y1, dur in Config.INTERVALS:
+            metrics = self._calc_metrics(y0, y1, dur, compute_gm=False)
+            gross_abs_growth.append(metrics["gross_growth_ha_per_year"])
+            gross_rel_growth.append(metrics["gross_relative_growth_pct_per_year"])
+
+        abs_g_array = np.asarray(gross_abs_growth, dtype=float)
+        rel_g_array = np.asarray(gross_rel_growth, dtype=float)
+
+        # Learn maxima from observed growth with a buffer.
+        if len(abs_g_array) == 1:
+            abs_buffer = 1.2
+            rel_buffer = 1.2
+        else:
+            abs_mean = np.mean(np.abs(abs_g_array))
+            rel_mean = np.mean(np.abs(rel_g_array))
+            abs_buffer = 1.0 + (np.std(abs_g_array) / abs_mean if abs_mean > 0 else 0.2)
+            rel_buffer = 1.0 + (np.std(rel_g_array) / rel_mean if rel_mean > 0 else 0.2)
+
+        Config.MAX_ABSOLUTE_GROWTH = float(max(np.max(np.abs(abs_g_array)) * abs_buffer, 1e-9))
+        Config.MAX_RELATIVE_GROWTH = float(max(np.max(np.abs(rel_g_array)) * rel_buffer, 1e-9))
+
+        print(f"\n📊 LEARNED Normalization Maxima:")
+        print(f"   Gross Absolute Growth: {Config.MAX_ABSOLUTE_GROWTH:.6f} ha/yr (buffer: {abs_buffer:.2f})")
+        print(f"   Gross Relative Growth: {Config.MAX_RELATIVE_GROWTH:.6f} %/yr (buffer: {rel_buffer:.2f})")
+
+        mcda = self.learner.learn_mcda_weights(abs_g_array, rel_g_array)
+        Config.MCDA_WEIGHTS = mcda
+        self.learned_params["mcda"] = mcda
+
+        # Learn spatial system from valid new urban pixels only.
+        u0 = self.data[2017]["urban"]
+        u1 = self.data[2024]["urban"]
+        vm = self.data[2017]["valid_mask"] & self.data[2024]["valid_mask"]
+        new_u = (u1 == 1) & (u0 == 0) & vm
+
+        spatial = self.learner.learn_spatial_system(new_u, u0)
+        self.spatial_system = spatial
+
+        # Save only compact metadata to JSON.
+        self.learned_params["spatial"] = {
+            "weights": spatial["weights"],
+            "modifier_params": spatial["modifier_params"],
+            "kernel_sigma": Config.SPATIAL_KERNEL_SIGMA,
+            "new_urban_pixels_used_for_learning": int(np.sum(new_u)),
+        }
+
+        # Second pass: compute final GM with learned normalization.
+        for name, y0, y1, dur in Config.INTERVALS:
+            print(f"\n{'=' * 60}\nInterval: {name} ({dur} years)\n{'=' * 60}")
+            self.results[name] = self._calc_metrics(y0, y1, dur, compute_gm=True)
+
+        self._print_results("2017-2024", self.results["2017-2024"])
+        return self.results
+
+    def _calc_metrics(self, y0, y1, dur, compute_gm=True):
+        u0 = self.data[y0]["urban"]
+        u1 = self.data[y1]["urban"]
+        vm = self.data[y0]["valid_mask"] & self.data[y1]["valid_mask"]
+
+        common = vm
+
+        # Counts in common valid domain.
+        p0_common = int(np.sum((u0 == 1) & common))
+        p1_common = int(np.sum((u1 == 1) & common))
+
+        # Raw counts for display.
+        p0_raw = int(np.sum(u0 == 1))
+        p1_raw = int(np.sum(u1 == 1))
+
+        a0_common = p0_common * Config.PIXEL_AREA_HA
+        a1_common = p1_common * Config.PIXEL_AREA_HA
+
+        # Change masks strictly inside common valid domain.
+        new_urban = (u1 == 1) & (u0 == 0) & common
+        lost_urban = (u0 == 1) & (u1 == 0) & common
+        stable_urban = (u0 == 1) & (u1 == 1) & common
+
+        gross_new_pixels = int(np.sum(new_urban))
+        gross_loss_pixels = int(np.sum(lost_urban))
+
+        gross_new_area_ha = gross_new_pixels * Config.PIXEL_AREA_HA
+        gross_loss_area_ha = gross_loss_pixels * Config.PIXEL_AREA_HA
+
+        net_delta_area_ha = a1_common - a0_common
+        net_delta_pixels = p1_common - p0_common
+
+        gross_growth_ha_per_year = gross_new_area_ha / dur
+        gross_relative_growth_pct_per_year = (gross_new_area_ha / a0_common) * 100.0 / dur if a0_common > 0 else 0.0
+
+        net_growth_ha_per_year = net_delta_area_ha / dur
+        net_relative_growth_pct_per_year = (net_delta_area_ha / a0_common) * 100.0 / dur if a0_common > 0 else 0.0
+
+        result = {
+            "year_t0": y0,
+            "year_t1": y1,
+            "duration_years": dur,
+
+            "pixels_t0_raw": p0_raw,
+            "pixels_t1_raw": p1_raw,
+            "pixels_t0_common": p0_common,
+            "pixels_t1_common": p1_common,
+
+            "area_t0_ha_common": a0_common,
+            "area_t1_ha_common": a1_common,
+
+            "delta_area_ha_common": net_delta_area_ha,
+            "delta_pixels_common": net_delta_pixels,
+
+            "gross_new_pixels": gross_new_pixels,
+            "gross_loss_pixels": gross_loss_pixels,
+            "gross_new_area_ha": gross_new_area_ha,
+            "gross_loss_area_ha": gross_loss_area_ha,
+
+            "gross_growth_ha_per_year": gross_growth_ha_per_year,
+            "gross_relative_growth_pct_per_year": gross_relative_growth_pct_per_year,
+
+            "net_growth_ha_per_year": net_growth_ha_per_year,
+            "net_relative_growth_pct_per_year": net_relative_growth_pct_per_year,
+
+            "total_growth_rate": net_delta_area_ha / a0_common if a0_common > 0 else 0.0,
+
+            "urban_t0": u0,
+            "urban_t1": u1,
+            "new_urban": new_urban,
+            "stable_urban": stable_urban,
+            "lost_urban": lost_urban,
+            "valid_mask": common,
+        }
+
+        if compute_gm:
+            gm_abs = np.clip(gross_growth_ha_per_year / Config.MAX_ABSOLUTE_GROWTH, 0.0, 1.0)
+            gm_rel = np.clip(gross_relative_growth_pct_per_year / Config.MAX_RELATIVE_GROWTH, 0.0, 1.0)
+
+            gm_comb = (
+                Config.MCDA_WEIGHTS["absolute"] * gm_abs +
+                Config.MCDA_WEIGHTS["relative"] * gm_rel
+            )
+
+            result["gm_absolute_normalized"] = float(gm_abs)
+            result["gm_relative_normalized"] = float(gm_rel)
+            result["gm_combined"] = float(gm_comb)
+        else:
+            result["gm_absolute_normalized"] = None
+            result["gm_relative_normalized"] = None
+            result["gm_combined"] = None
+
+        return result
+
+    def _print_results(self, name, m):
+        print(f"\n{name} Results:\n{'─' * 60}")
+        print(f"1. Raw urban pixels: {m['pixels_t0_raw']:,} → {m['pixels_t1_raw']:,}")
+        print(f"2. Common-domain area: {m['area_t0_ha_common']:,.0f} → {m['area_t1_ha_common']:,.0f} ha "
+              f"({m['delta_area_ha_common']:+,.2f} ha net)")
+        print(f"3. Gross new urban: {m['gross_new_area_ha']:,.2f} ha total "
+              f"({m['gross_growth_ha_per_year']:,.4f} ha/yr)")
+        print(f"4. Gross relative growth: {m['gross_relative_growth_pct_per_year']:.6f}%/yr")
+        print(f"5. Net growth: {m['net_growth_ha_per_year']:+,.4f} ha/yr")
+        print(f"6. Normalized GM - absolute: {m['gm_absolute_normalized']:.6f}")
+        print(f"7. Normalized GM - relative: {m['gm_relative_normalized']:.6f}")
+        print(f"8. Combined GM: {m['gm_combined']:.6f}")
+        print(f"9. Spatial pixels: New={np.sum(m['new_urban']):,}, Stable={np.sum(m['stable_urban']):,}, Lost={np.sum(m['lost_urban']):,}")
+
+
+class ImprovedRasterExporter:
+    def __init__(self, results, metadata, output_dir, spatial_system):
+        self.results = results
+        self.metadata = metadata
+        self.output_dir = output_dir
+        self.spatial_system = spatial_system
+
+    def export_raster(self):
+        print("\n" + "=" * 80)
+        print("EXPORTING SPATIAL GM RASTER")
+        print("=" * 80)
+
+        m = self.results["2017-2024"]
+        sp = self.spatial_system
+
+        if sp is None:
+            raise ValueError("Spatial system is missing. Cannot export raster.")
+
+        comps = sp["components"]
+        weights = sp["weights"]
+        params = sp["modifier_params"]
+
+        print(f"\nUsing learned parameters:")
+        print(f"  Weights: Dist={weights['distance']:.3f}, Dens={weights['density']:.3f}, Edge={weights['edge']:.3f}")
+        print(f"  Modifier range: [{params['min']:.3f}, {params['max']:.3f}]")
+
+        shape = self.metadata["shape"]
+        gm = np.full(shape, Config.NODATA_VALUE, dtype=np.float32)
+
+        gm[m["stable_urban"]] = 0.0
+        gm[m["lost_urban"]] = 0.0
+
+        if np.sum(m["new_urban"]) > 0 and comps is not None:
+            spatial_mod = (
+                weights["distance"] * comps["distance"] +
+                weights["density"] * comps["density"] +
+                weights["edge"] * comps["edge"]
+            )
+
+            scaled_mod = params["min"] + spatial_mod * (params["max"] - params["min"])
+
+            base = float(m["gm_combined"])
+            gm_spatial = base * scaled_mod
+            gm_spatial = np.clip(gm_spatial, 0.0, 1.0)
+
+            gm[m["new_urban"]] = gm_spatial[m["new_urban"]]
+
+        self._save(gm, "growth_magnitude_2017_2024_spatial.tif")
+
+        if np.sum(m["new_urban"]) > 0:
+            gm_new = gm[m["new_urban"]]
+            print(f"\n  📊 Spatial GM Statistics:")
+            print(f"     New urban: {np.sum(m['new_urban']):,} pixels")
+            print(f"     Range: [{np.min(gm_new):.6f}, {np.max(gm_new):.6f}]")
+            print(f"     Mean: {np.mean(gm_new):.6f}, Std: {np.std(gm_new):.6f}")
+            print(f"     Percentiles: 25th={np.percentile(gm_new, 25):.6f}, "
+                  f"50th={np.percentile(gm_new, 50):.6f}, 75th={np.percentile(gm_new, 75):.6f}")
+
+        composite_gm = float(np.mean(gm[m["new_urban"]])) if np.sum(m["new_urban"]) > 0 else 0.0
+
+        print(f"\n{'=' * 80}")
+        print(f"FINAL COMPOSITE GROWTH MAGNITUDE (CITY-LEVEL): {composite_gm:.6f}")
+        print(f"{'=' * 80}")
+        print("(Mean spatial GM across all new urban pixels.)")
+
+        return gm
+
+    def _save(self, data, fname):
+        fp = self.output_dir / fname
+        meta = {
+            "driver": "GTiff",
+            "dtype": "float32",
+            "count": 1,
+            "height": data.shape[0],
+            "width": data.shape[1],
+            "nodata": Config.NODATA_VALUE,
+            "compress": "lzw",
+            "transform": self.metadata.get("transform"),
+            "crs": self.metadata.get("crs"),
+        }
+        with rasterio.open(fp, "w", **meta) as dst:
+            dst.write(data.astype("float32"), 1)
+        print(f"  ✓ Saved: {fname}")
+
+
+def main():
+    try:
+        loader = UrbanDataLoader("Processed data")
+        data, metadata = loader.load_data()
+
+        calc = ImprovedGMCalculator(data)
+        results = calc.calculate_all_metrics()
+
+        exp = ImprovedRasterExporter(results, metadata, output_dir, calc.spatial_system)
+        gm_raster = exp.export_raster()
+
+        m = results["2017-2024"]
+        summary = pd.DataFrame([{
+            "period": "2017-2024",
+            "gross_new_area_ha": m["gross_new_area_ha"],
+            "gross_growth_ha_per_year": m["gross_growth_ha_per_year"],
+            "gross_relative_growth_pct_per_year": m["gross_relative_growth_pct_per_year"],
+            "net_growth_ha_per_year": m["net_growth_ha_per_year"],
+            "gm_absolute_normalized": m["gm_absolute_normalized"],
+            "gm_relative_normalized": m["gm_relative_normalized"],
+            "gm_combined": m["gm_combined"],
+            "final_composite_gm": float(np.mean(gm_raster[m["new_urban"]])) if np.sum(m["new_urban"]) > 0 else 0.0,
+        }])
+
+        summary_csv = output_dir / "gm_summary_2017_2024.csv"
+        summary.to_csv(summary_csv, index=False)
+
+        params_json = output_dir / "learned_parameters.json"
+        with open(params_json, "w", encoding="utf-8") as f:
+            json.dump(to_jsonable(calc.learned_params), f, indent=2)
+
+        print("\n" + "=" * 80)
+        print("✓ ANALYSIS COMPLETE")
+        print("=" * 80)
+        print("\nFixed points:")
+        print("  ✓ Learning pass separated from GM scoring pass")
+        print("  ✓ No None division")
+        print("  ✓ Common valid mask used for all change pixels")
+        print("  ✓ GM based on gross new urban growth")
+        print("  ✓ Net change still reported separately")
+        print("  ✓ JSON-safe learned parameters saved")
+        print("  ✓ Spatial GM no longer collapses to zero")
+        print("  ✓ Summary CSV and learned parameters saved")
+
+        print(f"\nOutput files:")
+        print(f"  - {output_dir / 'growth_magnitude_2017_2024_spatial.tif'}")
+        print(f"  - {summary_csv}")
+        print(f"  - {params_json}")
+
+        print(f"\nEnd: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
