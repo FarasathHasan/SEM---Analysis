@@ -1,0 +1,227 @@
+import numpy as np
+import rasterio
+from scipy.ndimage import uniform_filter, label
+import warnings
+from pathlib import Path
+import json
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+INPUT_FILE_2017 = "Processed data/2017_cleaned.tif"
+INPUT_FILE_2024 = "Processed data/2024_cleaned.tif"
+OUTPUT_DIR = "outputs_lum"
+CITY_NAME = "your_city_name"   # <-- CHANGE EACH TIME
+
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# DATA‑DRIVEN WINDOW SIZE (same as original)
+# =============================================================================
+def learn_window_size(data, cell_size_m, nodata_value=None):
+    valid = (data > 0)
+    if nodata_value is not None:
+        valid &= (data != nodata_value)
+
+    min_px = max(11, int(np.ceil(300.0 / cell_size_m)))
+    max_px = min(301, int(np.floor(1500.0 / cell_size_m)))
+    if min_px > max_px:
+        min_px, max_px = max_px, min_px
+
+    unique_classes = np.unique(data[valid])
+    unique_classes = unique_classes[unique_classes > 0]
+
+    patch_sizes = []
+    for cls in unique_classes:
+        cls_mask = (data == cls) & valid
+        labeled, n_feat = label(cls_mask)
+        if n_feat > 0:
+            sizes = np.bincount(labeled.ravel())[1:]
+            patch_sizes.extend(sizes.tolist())
+
+    if patch_sizes:
+        median_area_px = float(np.median(patch_sizes))
+        patch_diam_px = max(1, int(np.sqrt(median_area_px)))
+        window_px = patch_diam_px * 3
+        window_px = int(np.clip(window_px, min_px, max_px))
+    else:
+        window_px = min_px
+
+    if window_px % 2 == 0:
+        window_px += 1
+
+    print(f"  Learned window: {window_px} px = {window_px * cell_size_m:.0f} m")
+    return window_px
+
+# =============================================================================
+# SHEI CALCULATION (unchanged, robust edge handling)
+# =============================================================================
+def calculate_shei(raster_data, cell_size_m, nodata_value=None, window_size=None):
+    if window_size is None:
+        window_size = learn_window_size(raster_data, cell_size_m, nodata_value)
+    win_area = float(window_size * window_size)
+
+    valid_px = (raster_data > 0)
+    if nodata_value is not None:
+        valid_px &= (raster_data != nodata_value)
+
+    unique_classes = np.unique(raster_data[valid_px])
+    unique_classes = unique_classes[unique_classes > 0]
+    n_classes = len(unique_classes)
+
+    if n_classes < 2:
+        out = np.where(valid_px, 0.0, np.nan).astype(np.float32)
+        return out, window_size
+
+    class_counts = []
+    for cls in unique_classes:
+        cls_mask = (raster_data == cls) & valid_px
+        cls_float = cls_mask.astype(np.float32)
+        local_cls = uniform_filter(cls_float, size=window_size,
+                                   mode='reflect') * win_area
+        class_counts.append(local_cls)
+
+    total_count = np.sum(class_counts, axis=0)
+    entropy_map = np.zeros(raster_data.shape, dtype=np.float64)
+
+    for local_cls in class_counts:
+        with np.errstate(divide='ignore', invalid='ignore'):
+            p = np.divide(local_cls, total_count,
+                          out=np.zeros_like(local_cls),
+                          where=(total_count > 0))
+            term = -p * np.log(p)
+            term = np.where(np.isfinite(term), term, 0.0)
+        entropy_map += term
+
+    entropy_map /= np.log(n_classes)
+    entropy_map = np.clip(entropy_map, 0.0, 1.0).astype(np.float32)
+    entropy_map[~valid_px] = np.nan
+    entropy_map[total_count == 0] = np.nan
+    if nodata_value is not None:
+        entropy_map[raster_data == nodata_value] = np.nan
+
+    return entropy_map, window_size
+
+# =============================================================================
+# MAIN ANALYSIS
+# =============================================================================
+def main():
+    print("=" * 70)
+    print("LUM COMPOSITE – NEW GROWTH FOCUS")
+    print(f"City: {CITY_NAME}")
+    print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+
+    # ---- Load rasters ----
+    print("\nLoading 2017 …")
+    with rasterio.open(INPUT_FILE_2017) as src:
+        data_2017 = src.read(1)
+        profile = src.profile.copy()
+        nodata = src.nodata
+        cell_size = abs(src.transform[0]) if src.transform and abs(src.transform[0]) > 0 else 10.0
+    print(f"  2017 shape: {data_2017.shape}, cell: {cell_size}m, nodata: {nodata}")
+
+    print("Loading 2024 …")
+    with rasterio.open(INPUT_FILE_2024) as src:
+        data_2024 = src.read(1)
+    if data_2017.shape != data_2024.shape:
+        raise ValueError("Raster shapes differ")
+
+    # ---- Identify new urban mask ----
+    # Urban class = 1
+    urban_2017 = (data_2017 == 1)
+    urban_2024 = (data_2024 == 1)
+    new_urban = urban_2024 & (~urban_2017)
+    n_new = int(new_urban.sum())
+    print(f"\nNew urban pixels: {n_new:,} ({n_new * cell_size**2 / 10000:.2f} ha)")
+
+    if n_new == 0:
+        print("⚠️  No new urban growth → scores set to 0")
+        shei_new = 0.0
+        lum_change_new = 0.0
+    else:
+        # ---- Compute SHEI maps ----
+        print("\nComputing SHEI 2017 …")
+        shei_2017, win = calculate_shei(data_2017, cell_size, nodata)
+        print("Computing SHEI 2024 …")
+        shei_2024, win = calculate_shei(data_2024, cell_size, nodata)
+
+        # LUM change map
+        lum_change = shei_2024 - shei_2017
+
+        # ---- Mask to new urban pixels (only where valid) ----
+        valid_new = new_urban & np.isfinite(shei_2024) & np.isfinite(lum_change)
+        shei_new_vec = shei_2024[valid_new]
+        lum_change_vec = lum_change[valid_new]
+
+        shei_new = float(np.mean(shei_new_vec)) if len(shei_new_vec) > 0 else 0.0
+        lum_change_new = float(np.mean(lum_change_vec)) if len(lum_change_vec) > 0 else 0.0
+
+    # ---- Composite scores ----
+    composite_scores = {
+        "city": CITY_NAME,
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "new_urban_pixels": n_new,
+        "new_urban_area_ha": round(n_new * cell_size**2 / 10000, 2),
+        "composite_new_growth_shei_2024": round(shei_new, 6),
+        "composite_new_growth_lum_change": round(lum_change_new, 6),
+        "window_size_pixels": win if n_new > 0 else 0,
+        "window_size_meters": round(win * cell_size, 0) if n_new > 0 else 0,
+        "interpretation": {
+            "shei_2024": "0=homogeneous, 1=mixed (higher = more diverse new development)",
+            "lum_change": "Negative = diversity decreased → sprawl-like expansion. "
+                          "Positive = diversity increased → balanced expansion."
+        }
+    }
+
+    # ---- Print ----
+    print("\n" + "=" * 70)
+    print("COMPOSITE LUM SCORES (NEW GROWTH ONLY)")
+    print("=" * 70)
+    print(f"  New Growth SHEI 2024:      {shei_new:.6f}")
+    print(f"  New Growth LUM Change:      {lum_change_new:.6f}")
+    print("  (Use composite_new_growth_lum_change for cross‑city ranking)")
+    print("=" * 70)
+
+    # ---- Save JSON ----
+    json_path = Path(OUTPUT_DIR) / f"{CITY_NAME}_LUM_new_growth_composite.json"
+    with open(json_path, "w") as f:
+        json.dump(composite_scores, f, indent=2)
+    print(f"\n✓ JSON saved: {json_path}")
+
+    # ---- Append to cross‑city CSV ----
+    csv_path = "cross_city_lum_new_growth.csv"
+    write_header = not Path(csv_path).exists()
+    with open(csv_path, "a", newline="") as csvfile:
+        if write_header:
+            csvfile.write("city,new_urban_pixels,new_urban_area_ha,"
+                          "composite_new_growth_shei_2024,"
+                          "composite_new_growth_lum_change,"
+                          "timestamp\n")
+        csvfile.write(f"{CITY_NAME},{n_new},"
+                      f"{n_new * cell_size**2 / 10000:.2f},"
+                      f"{shei_new:.6f},{lum_change_new:.6f},"
+                      f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    print(f"✓ Appended to cross‑city CSV: {csv_path}")
+
+    # ---- Optional: save the LUM change raster for visualisation ----
+    if n_new > 0:
+        out_raster = Path(OUTPUT_DIR) / "lum_change_new_growth_2017_2024.tif"
+        mask = new_urban & np.isfinite(lum_change)
+        out_data = np.where(mask, lum_change, -9999.0).astype(np.float32)
+        meta = profile.copy()
+        meta.update(dtype="float32", nodata=-9999.0, compress="lzw")
+        with rasterio.open(out_raster, "w", **meta) as dst:
+            dst.write(out_data, 1)
+        print(f"✓ Raster saved: {out_raster}")
+
+    print("\n" + "=" * 70)
+    print("ANALYSIS COMPLETE")
+    print("=" * 70)
+    print(f"End: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
+    main()
