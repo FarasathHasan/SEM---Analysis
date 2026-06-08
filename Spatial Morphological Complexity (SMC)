@@ -1,0 +1,488 @@
+import json
+import warnings
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import Tuple, Dict, Optional
+
+import numpy as np
+import rasterio
+import pywt
+from scipy.ndimage import uniform_filter, zoom, label
+from skimage.measure import perimeter
+
+warnings.filterwarnings("ignore")
+
+
+INPUT_FILE_2017 = "Processed data/2017_cleaned.tif"
+INPUT_FILE_2024 = "Processed data/2024_cleaned.tif"
+OUTPUT_DIR      = "outputs_smc"
+CITY_NAME       = "city_name"          
+
+output_dir = Path(OUTPUT_DIR)
+output_dir.mkdir(parents=True, exist_ok=True)
+
+
+@dataclass
+class Config:
+    CELL_SIZE:     float = 10.0
+    PIXEL_AREA_M2: float = 100.0
+    PIXEL_AREA_HA: float = 0.01
+
+    # Fractal analysis box sizes (pixels)
+    BOX_SIZES:   Tuple[int, ...] = (2, 3, 5, 8, 13, 21, 34, 55, 89, 144)
+
+    # Lacunarity gliding‑box windows (pixels)
+    LAC_WINDOWS: Tuple[int, ...] = (3, 5, 9, 15, 25)
+
+    # Wavelet
+    WAVELET:           str = "db4"
+    WAVELET_MAX_LEVEL: int = 4
+
+    # Spatial proxy map subsampling
+    MAP_SUBSAMPLE: int = 4
+
+    RANDOM_SEED: int = 42
+
+    # Data‑driven normalisation parameters
+    PATCH_SIZE:        int = 100      # size of random patch (pixels)
+    N_PATCHES:         int = 200      # number of random samples
+    PERC_LOW:          float = 5.0    # lower percentile for normalisation range
+    PERC_HIGH:         float = 95.0   # upper percentile for normalisation range
+
+
+
+
+def box_counting_fractal_dim(mask, boxes):
+    counts, sizes_used = [], []
+    h, w = mask.shape
+    for s in boxes:
+        if s > h or s > w:
+            continue
+        cnt = sum(
+            1
+            for i in range(0, h, s)
+            for j in range(0, w, s)
+            if np.any(mask[i:i + s, j:j + s])
+        )
+        if cnt > 0:
+            counts.append(cnt)
+            sizes_used.append(s)
+    if len(counts) >= 3:
+        log_s = np.log(np.array(sizes_used, dtype=float))
+        log_n = np.log(np.array(counts,     dtype=float))
+        dim   = -np.polyfit(log_s, log_n, 1)[0]
+    else:
+        dim = 1.5
+    return float(np.clip(dim, 1.0, 2.0))
+
+
+def gliding_box_lacunarity(mask, windows, sample_size=2000, rng=None):
+    if rng is None:
+        rng = np.random.default_rng(Config.RANDOM_SEED)
+    h, w = mask.shape
+    lac_vals = []
+    for win in windows:
+        if win > h or w:
+            continue
+        n_pos = (h - win + 1) * (w - win + 1)
+        if n_pos <= 0:
+            continue
+        n = min(sample_size, n_pos)
+        masses = np.empty(n, dtype=float)
+        for k in range(n):
+            i = rng.integers(0, h - win + 1)
+            j = rng.integers(0, w - win + 1)
+            masses[k] = mask[i:i + win, j:j + win].sum()
+        mean_m = masses.mean()
+        var_m  = masses.var()
+        lac_vals.append((var_m / (mean_m ** 2)) + 1.0 if mean_m > 0 else 1.0)
+    return float(np.mean(lac_vals)) if lac_vals else 1.0
+
+
+def wavelet_energy(mask, max_level, wavelet="db4"):
+    max_possible = pywt.dwtn_max_level(mask.shape, wavelet)
+    level = int(min(max_level, max_possible))
+    if level < 1:
+        return 0.0
+    coeffs = pywt.wavedec2(mask.astype(float), wavelet, level=level)
+    energy = sum(np.sum(sub ** 2) for lvl in range(1, len(coeffs)) for sub in coeffs[lvl])
+    return float(energy / (mask.shape[0] * mask.shape[1]))
+
+
+def shape_metrics(mask, cell_size_m):
+    area_px = int(mask.sum())
+    area_m2 = area_px * (cell_size_m ** 2)
+    if area_px == 0:
+        return {
+            "si":            1.0,
+            "compactness":   0.0,
+            "edge_density":  0.0,
+            "fragmentation": 0.0,
+        }
+    perim_px = perimeter(mask, neighborhood=4)
+    perim_m  = perim_px * cell_size_m
+    si       = perim_m / (2.0 * np.sqrt(np.pi * area_m2)) if area_m2 > 0 else 1.0
+    comp     = (4.0 * np.pi * area_m2) / (perim_m ** 2)   if perim_m  > 0 else 0.0
+    compactness = 1.0 - float(np.clip(comp, 0.0, 1.0))
+    edge_density = perim_m / area_m2 if area_m2 > 0 else 0.0
+    _, n_patches = label(mask)
+    fragmentation = float(np.sqrt(n_patches))
+    return {
+        "si":            float(si),
+        "compactness":   float(compactness),
+        "edge_density":  float(edge_density),
+        "fragmentation": fragmentation,
+    }
+
+
+def sample_random_patches(mask, patch_size, n_patches, rng):
+    """
+    Extract random binary patches (patch_size x patch_size) from the mask.
+    Returns a list of 2D uint8 arrays.
+    """
+    h, w = mask.shape
+    if h < patch_size or w < patch_size:
+        # If the whole mask is smaller than a patch, use the whole mask repeated
+        return [mask] * n_patches
+
+    patches = []
+    for _ in range(n_patches):
+        i = rng.integers(0, h - patch_size + 1)
+        j = rng.integers(0, w - patch_size + 1)
+        patch = mask[i:i + patch_size, j:j + patch_size].copy()
+        patches.append(patch)
+    return patches
+
+
+def compute_metrics_for_patches(patches, cell_size, cfg, rng):
+    """
+    Compute all raw metrics for each patch.
+    Returns a dict mapping metric name -> list of values.
+    """
+    out = {"fractal": [], "lacunarity": [], "wavelet": [],
+           "shape_index": [], "compactness": [], "edge_density": [], "fragmentation": []}
+
+    for patch in patches:
+        fd  = box_counting_fractal_dim(patch, cfg.BOX_SIZES)
+        lac = gliding_box_lacunarity(patch, cfg.LAC_WINDOWS, rng=rng)
+        wav = wavelet_energy(patch, cfg.WAVELET_MAX_LEVEL, cfg.WAVELET)
+        shp = shape_metrics(patch, cell_size)
+
+        out["fractal"].append(fd)
+        out["lacunarity"].append(lac)
+        out["wavelet"].append(wav)
+        out["shape_index"].append(shp["si"])
+        out["compactness"].append(shp["compactness"])
+        out["edge_density"].append(shp["edge_density"])
+        out["fragmentation"].append(shp["fragmentation"])
+    return out
+
+
+def entropy_weights(norm_matrix):
+    """
+    Compute entropy‑based weights from a (n_samples, n_features) matrix of
+    already normalised [0,1] values.
+    Higher weight = lower entropy (more structured variation).
+    """
+    n, m = norm_matrix.shape
+    # Avoid log(0) by adding a tiny offset
+    eps = 1e-12
+    col_sums = norm_matrix.sum(axis=0) + eps
+    p = norm_matrix / col_sums
+    p = np.clip(p, eps, 1.0)        # stability
+    entropy = -np.sum(p * np.log(p), axis=0)
+    max_entropy = np.log(n)
+    # Degree of diversification
+    d = 1.0 - entropy / max_entropy
+    w = d / d.sum()
+    return dict(zip(["fractal", "lacunarity", "wavelet",
+                     "shape_index", "compactness", "edge_density", "fragmentation"],
+                    w))
+
+
+def learn_city_normalization(mask, cell_size, cfg):
+    """
+    From the new‑growth mask, sample random patches, compute metrics,
+    derive normalisation ranges (low/high percentiles) and entropy weights.
+    """
+    rng = np.random.default_rng(cfg.RANDOM_SEED + 1)  # separate seed from main
+    patches = sample_random_patches(mask, cfg.PATCH_SIZE, cfg.N_PATCHES, rng)
+
+    # Compute all metrics for all patches
+    patch_metrics = compute_metrics_for_patches(patches, cell_size, cfg, rng)
+
+    # For each metric, determine the [low, high] range using percentiles
+    ranges = {}
+    metric_names = list(patch_metrics.keys())
+    for name in metric_names:
+        vals = np.array(patch_metrics[name])
+        low = np.percentile(vals, cfg.PERC_LOW)
+        high = np.percentile(vals, cfg.PERC_HIGH)
+        if high == low:
+            high = low + 1e-12  # avoid division by zero
+        ranges[name] = (float(low), float(high))
+
+    # Normalise each patch’s metrics using these ranges (to [0,1])
+    norm_patch_matrix = np.zeros((len(patches), len(metric_names)), dtype=float)
+    for i, name in enumerate(metric_names):
+        a, b = ranges[name]
+        norm_patch_matrix[:, i] = np.clip((np.array(patch_metrics[name]) - a) / (b - a), 0.0, 1.0)
+
+    # Compute entropy weights
+    weights = entropy_weights(norm_patch_matrix)
+
+    return ranges, weights
+
+
+def create_spatial_smc_map(mask, subsample=4):
+    small      = mask[::subsample, ::subsample].astype(float)
+    local_mean = uniform_filter(small,      size=9, mode="reflect")
+    local_sq   = uniform_filter(small ** 2, size=9, mode="reflect")
+    local_std  = np.sqrt(np.maximum(local_sq - local_mean ** 2, 0))
+    vmax = local_std.max()
+    if vmax > 0:
+        local_std /= vmax
+    full = zoom(local_std, subsample, order=1)[:mask.shape[0], :mask.shape[1]]
+    return np.where(mask > 0, full, 0.0).astype(np.float32)
+
+
+def compute_smc_for_mask(mask, cell_size, cfg, year_label="new_growth"):
+    """
+    Compute raw metrics, learn normalisation/weights from city data,
+    produce normalised metrics and composite SMC score.
+    """
+    WIDE = "=" * 70
+    print("\n" + WIDE)
+    print("  Processing mask : {}".format(year_label))
+    print(WIDE)
+
+    urban_pixels = int(mask.sum())
+    area_km2     = urban_pixels * (cell_size ** 2) / 1e6
+    print("  Urban pixels    : {:,}".format(urban_pixels))
+    print("  Urban area      : {:.4f} km2".format(area_km2))
+
+    rng_main = np.random.default_rng(cfg.RANDOM_SEED)
+
+    # ---- Learn ranges and weights from city patches ------------------------
+    print("  Learning normalisation ranges and weights from {} random patches...".format(cfg.N_PATCHES))
+    ranges, entropy_w = learn_city_normalization(mask, cell_size, cfg)
+
+    # ---- Raw metrics on the whole mask -------------------------------------
+    print("  Computing global raw metrics ...")
+    fd  = box_counting_fractal_dim(mask, cfg.BOX_SIZES)
+    lac = gliding_box_lacunarity(mask, cfg.LAC_WINDOWS, rng=rng_main)
+    wav = wavelet_energy(mask, cfg.WAVELET_MAX_LEVEL, cfg.WAVELET)
+    shp = shape_metrics(mask, cell_size)
+
+    raw = {
+        "fractal":       fd,
+        "lacunarity":    lac,
+        "wavelet":       wav,
+        "shape_index":   shp["si"],
+        "compactness":   shp["compactness"],
+        "edge_density":  shp["edge_density"],
+        "fragmentation": shp["fragmentation"],
+    }
+
+    # ---- Normalise global metrics with learned ranges ----------------------
+    norm = {}
+    for key in raw:
+        a, b = ranges[key]
+        norm[key] = float(np.clip((raw[key] - a) / (b - a), 0.0, 1.0))
+
+    # ---- Composite SMC with learnt entropy weights -------------------------
+    composite = float(sum(norm[k] * entropy_w[k] for k in norm))
+
+    # ---- Diagnostic breakdown ----------------------------------------------
+    DASH = "-" * 70
+    print("\n  Learned normalisation ranges (patch 5‑95 %ile) :")
+    for k, (lo, hi) in ranges.items():
+        print("    {}: [{:.6f}, {:.6f}]".format(k, lo, hi))
+
+    print("\n  Learned entropy weights (higher = more informative variation) :")
+    for k, w in entropy_w.items():
+        print("    {}: {:.4f}".format(k, w))
+
+    print("\n" + DASH)
+    print("  {:<20} {:>12}  {:>12}  {:>8}  {:>12}".format(
+        "METRIC", "RAW", "NORMALISED", "WEIGHT", "CONTRIBUTION"))
+    print(DASH)
+    for key in norm:
+        print("  {:<20} {:>12.6f}  {:>12.6f}  {:>8.4f}  {:>12.6f}".format(
+            key,
+            raw[key],
+            norm[key],
+            entropy_w[key],
+            norm[key] * entropy_w[key],
+        ))
+    print(DASH)
+    print("  {:<20} {:>12}  {:>12}  {:>8}  {:>12.6f}".format(
+        "COMPOSITE SMC", "", "", "", composite))
+    print(DASH + "\n")
+
+    return {
+        "mask":             mask,
+        "area_km2":         area_km2,
+        "raw":              raw,
+        "norm":             norm,
+        "ranges":           ranges,
+        "weights":          entropy_w,
+        "smc_global":       composite,
+        "smc_map":          create_spatial_smc_map(mask, cfg.MAP_SUBSAMPLE),
+    }
+
+
+def load_raster(path):
+    with rasterio.open(path) as src:
+        data    = src.read(1)
+        profile = src.profile.copy()
+        cell_sz = abs(src.transform.a) \
+                  if (src.transform and abs(src.transform.a) > 0) \
+                  else Config.CELL_SIZE
+        urban   = (data == 1).astype(np.uint8)
+    return urban, profile, cell_sz
+
+
+def save_raster(data, mask, filename, profile):
+    out_path = output_dir / filename
+    out_data = np.where(mask > 0, data, -9999.0).astype(np.float32)
+    meta = {
+        "driver":    "GTiff",
+        "dtype":     "float32",
+        "count":     1,
+        "height":    out_data.shape[0],
+        "width":     out_data.shape[1],
+        "nodata":    -9999.0,
+        "compress":  "lzw",
+        "transform": profile.get("transform"),
+        "crs":       profile.get("crs"),
+    }
+    with rasterio.open(out_path, "w", **meta) as dst:
+        dst.write(out_data, 1)
+    print("  [OK] Saved: {}".format(filename))
+
+
+def check_alignment(prof_a, prof_b, shape_a, shape_b):
+    if shape_a != shape_b:
+        raise ValueError("Shapes differ: {} vs {}".format(shape_a, shape_b))
+    if prof_a.get("crs") != prof_b.get("crs"):
+        raise ValueError("CRS differs between the two rasters.")
+    if prof_a.get("transform") != prof_b.get("transform"):
+        raise ValueError("Affine transform differs – rasters are not co‑registered.")
+
+
+def main():
+    try:
+        WIDE = "=" * 70
+        print(WIDE)
+        print("  NEW GROWTH COMPOSITE SMC  –  FULLY DATA‑DRIVEN (per‑city learning)")
+        print(WIDE)
+        print("  Start : {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        print("  City  : {}\n".format(CITY_NAME))
+
+        # 1. Load rasters
+        urban_2017, profile_2017, cell_size = load_raster(INPUT_FILE_2017)
+        urban_2024, profile_2024, _         = load_raster(INPUT_FILE_2024)
+
+        # 2. Verify spatial alignment
+        check_alignment(profile_2017, profile_2024,
+                        urban_2017.shape, urban_2024.shape)
+
+        # 3. Build config with actual raster metadata
+        cfg = Config()
+        cfg.CELL_SIZE     = cell_size
+        cfg.PIXEL_AREA_M2 = cell_size ** 2
+        cfg.PIXEL_AREA_HA = cfg.PIXEL_AREA_M2 / 10_000.0
+        print("  Cell size read from raster : {:.2f} m".format(cell_size))
+
+        # 4. New‑growth mask
+        new_urban = ((urban_2024 == 1) & (urban_2017 == 0)).astype(np.uint8)
+        n_new     = int(new_urban.sum())
+        print("  New urban pixels           : {:,}".format(n_new))
+        print("  New urban area             : {:.2f} ha".format(
+              n_new * cfg.PIXEL_AREA_HA))
+
+        if n_new == 0:
+            print("\n  [!] No new urban growth detected.  Composite SMC = 0.0")
+            composite_smc = 0.0
+            results       = None
+            ranges        = {}
+            weights       = {}
+        else:
+            results       = compute_smc_for_mask(
+                                new_urban, cell_size, cfg,
+                                year_label="new_growth_2017_2024")
+            composite_smc = results["smc_global"]
+            ranges        = results["ranges"]
+            weights       = results["weights"]
+
+            # Save spatial proxy GeoTIFF
+            save_raster(results["smc_map"], new_urban,
+                        "smc_new_growth_proxy_2017_2024.tif", profile_2024)
+
+        # Final report
+        print("\n" + WIDE)
+        print("  FINAL RESULT")
+        print(WIDE)
+        print("  City            : {}".format(CITY_NAME))
+        print("  Composite SMC   : {:.6f}".format(composite_smc))
+        print("  Interpretation  : 0 = compact / simple  |  1 = fragmented / complex")
+        print(WIDE)
+
+        # Save summary JSON
+        summary = {
+            "city":                     CITY_NAME,
+            "timestamp":                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "composite_smc_new_growth": round(composite_smc, 6),
+            "new_urban_pixels":         n_new,
+            "new_urban_area_ha":        n_new * cfg.PIXEL_AREA_HA,
+            "data_driven_parameters": {
+                "patch_size":           cfg.PATCH_SIZE,
+                "n_patches":            cfg.N_PATCHES,
+                "percentile_low":       cfg.PERC_LOW,
+                "percentile_high":      cfg.PERC_HIGH,
+                "learned_ranges":       {k: list(v) for k, v in ranges.items()},
+                "entropy_weights":      {k: round(v, 6) for k, v in weights.items()},
+            },
+            "notes": (
+                "Fully data‑driven composite: normalisation ranges = 5‑th / 95‑th percentiles "
+                "from random patches; weights = entropy weighting on the same patches."
+            ),
+        }
+        if results is not None:
+            summary["raw_metrics"]        = {k: float(v) for k, v in results["raw"].items()}
+            summary["normalised_metrics"] = {k: float(v) for k, v in results["norm"].items()}
+
+        json_path = output_dir / "composite_smc_new_growth.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2)
+        print("\n  [OK] JSON saved : {}".format(json_path))
+
+        # Append to cross‑city CSV
+        csv_path  = Path("cross_city_smc_new_growth.csv")
+        write_hdr = not csv_path.exists()
+        with open(csv_path, "a", newline="") as fh:
+            if write_hdr:
+                fh.write("city,composite_smc_new_growth,new_urban_pixels,"
+                          "new_urban_area_ha,timestamp\n")
+            fh.write("{},{:.6f},{},{:.2f},{}\n".format(
+                CITY_NAME, composite_smc, n_new,
+                n_new * cfg.PIXEL_AREA_HA,
+                datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            ))
+        print("  [OK] Appended to cross‑city CSV : {}".format(csv_path))
+
+        print("\n" + WIDE)
+        print("  ANALYSIS COMPLETE")
+        print(WIDE)
+        print("  End : {}".format(datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+
+    except Exception as exc:
+        print("\n  ERROR: {}".format(exc))
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
