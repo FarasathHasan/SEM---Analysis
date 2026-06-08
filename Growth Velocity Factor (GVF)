@@ -1,0 +1,357 @@
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+from pathlib import Path
+import warnings
+warnings.filterwarnings("ignore")
+
+import rasterio
+from scipy.ndimage import gaussian_filter, zoom
+from scipy.spatial import KDTree
+from tqdm import tqdm
+from datetime import datetime
+
+SEED = 42
+np.random.seed(SEED)
+
+print(f"Starting GVF Analysis (2017-2024) - data-driven...")
+print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+# Output
+output_dir = Path("outputs_gvf_2017_2024_corrected")
+output_dir.mkdir(parents=True, exist_ok=True)
+
+class StudyAreaHandler:
+    """Create study area mask and basic helpers."""
+
+    @staticmethod
+    def create_study_area_mask(reference_path):
+        print(f"Creating study area mask from: {reference_path}")
+        with rasterio.open(reference_path) as src:
+            reference_data = src.read(1)
+            meta = src.meta.copy()
+            transform = src.transform
+            crs = src.crs
+            src_nodata = src.nodata
+
+        nodata_mask = StudyAreaHandler.detect_nodata(reference_data, src_nodata)
+        study_area_mask = ~nodata_mask
+
+        print(f"Study area shape: {reference_data.shape}")
+        print(f"Valid study area pixels: {np.sum(study_area_mask):,}")
+
+        return study_area_mask, meta, transform, crs
+
+    @staticmethod
+    def detect_nodata(data, src_nodata=None):
+        mask = (
+            np.isnan(data) |
+            np.isinf(data) |
+            (data < -1e10) |
+            (data > 1e10) |
+            (data == -9999) |
+            (data == -32767) |
+            (data == -3.4028235e+38)
+        )
+        if src_nodata is not None:
+            mask = mask | (data == src_nodata)
+        return mask
+
+    @staticmethod
+    def align_to_study_area(data, study_area_mask, reference_shape, fill_value=0):
+        """
+        Resize data to reference_shape using scipy.ndimage.zoom (nearest-neighbour).
+        Uses a safe integer dtype so nodata like -9999 can be stored without overflow.
+        """
+        if data.shape != reference_shape:
+            print(f"  Resizing from {data.shape} to {reference_shape}")
+            zoom_y = reference_shape[0] / data.shape[0]
+            zoom_x = reference_shape[1] / data.shape[1]
+            data = zoom(data, (zoom_y, zoom_x), order=0)
+
+        # Use a dtype that can safely hold -9999
+        safe_dtype = np.int16
+
+        aligned = np.full(reference_shape, fill_value, dtype=safe_dtype)
+        data = data.astype(safe_dtype, copy=False)
+
+        aligned[study_area_mask] = data[study_area_mask]
+        aligned[~study_area_mask] = np.int16(-9999)
+        return aligned
+
+class GVFGeneratorCorrected:
+    """Compute GVF using nearest base year for growth calculation.
+       Returns a single speed raster for the analysis period.
+    """
+
+    @staticmethod
+    def compute_gvf(urban_start, urban_end, study_area_mask, start_year, end_year, cell_size):
+        time_span = end_year - start_year
+        print(f"\nComputing corrected GVF ({start_year}-{end_year})...")
+        print(f" - Growth {start_year}-{end_year}: base = nearest {start_year} urban; time = {time_span} years")
+        print(f" - Existing {start_year} urban: speed = 0")
+
+        # initialize
+        speed = np.full(urban_start.shape, -9999.0, dtype=np.float32)
+
+        # masks
+        existing_start = (urban_start == 1) & study_area_mask
+        growth_mask = (urban_end == 1) & (urban_start == 0) & study_area_mask
+
+        # assign stable existing
+        speed[existing_start] = 0.0
+
+        print(f"  Existing {start_year} urban: {np.sum(existing_start):,} pixels")
+        print(f"  Growth {start_year}-{end_year}: {np.sum(growth_mask):,} pixels")
+
+        if np.sum(growth_mask) == 0:
+            print("  No growth pixels found.")
+            return speed
+
+        # prepare KDTree
+        urban_coords_start = np.argwhere(urban_start > 0)
+
+        if len(urban_coords_start) == 0:
+            print(f"  Warning: no {start_year} urban pixels found. Cannot compute distances.")
+            return speed
+
+        tree_start = KDTree(urban_coords_start)
+
+        # Process growth using tree_start (distance / time_span)
+        coords_growth = np.argwhere(growth_mask)
+        batch_size = 10000
+        n_batches = int(np.ceil(len(coords_growth) / batch_size))
+        print(f"\n  Processing {start_year}-{end_year} growth pixels (base: {start_year})...")
+
+        for batch_idx in range(n_batches):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(coords_growth))
+            batch = coords_growth[start_idx:end_idx]
+
+            for gy, gx in tqdm(batch, desc=f"Growth Batch {batch_idx+1}/{n_batches}", leave=False):
+                dist_pix, _ = tree_start.query([gy, gx])
+                dist_m = dist_pix * cell_size
+                speed_val = dist_m / time_span
+                speed[gy, gx] = float(speed_val)
+
+        # Apply spatial smoothing for visual consistency
+        print("\n  Applying spatial smoothing to growth speeds...")
+        temp = speed.copy()
+        temp[~growth_mask] = 0
+        sm = gaussian_filter(temp, sigma=1.5)
+        speed[growth_mask] = sm[growth_mask]
+
+        # final statistics
+        print("\n" + "=" * 60)
+        print(f"GVF STATISTICS ({start_year}-{end_year})")
+        print("=" * 60)
+        vals = speed[growth_mask]
+        vals = vals[vals != -9999]
+        if len(vals) > 0:
+            print(f"  Growth {start_year}-{end_year} ({time_span}y): mean={np.mean(vals):.2f}, median={np.median(vals):.2f}, max={np.max(vals):.2f} m/year")
+
+        # verification counts
+        print("\n  Verification:")
+        print(f"    Urban {start_year} total: {np.sum(urban_start == 1):,}")
+        print(f"    Urban {end_year} total: {np.sum(urban_end == 1):,}")
+        print(f"    Growth (net-new {start_year}->{end_year}): {np.sum(growth_mask):,}")
+
+        return speed
+
+class DataLoader:
+    def __init__(self, base_path="Processed data"):
+        self.base_path = Path(base_path)
+        self.data = {}
+        self.reference_meta = None
+        self.study_area_mask = None
+        self.reference_shape = None
+        self.transform = None
+        self.crs = None
+        self.cell_size = None
+
+    def load_urban_data(self, start_year, end_year):
+        print(f"\nLOADING URBAN DATA ({start_year}, {end_year})")
+
+        # ==========================================================
+        # IMPORTANT: PASTE YOUR FILE PATHS HERE
+        # ==========================================================
+        start_file_path = "Processed data/2017.tif"
+        end_file_path = "Processed data/2024.tif"
+        # ==========================================================
+
+        # Use end year as reference for study area
+        study_area_path = Path(end_file_path)
+        if not study_area_path.exists():
+            print(f"Error: {end_file_path} not found.")
+            print("Please update the file paths in the code.")
+            raise FileNotFoundError(f"Could not find: {end_file_path}")
+
+        self.study_area_mask, self.reference_meta, self.transform, self.crs = StudyAreaHandler.create_study_area_mask(str(study_area_path))
+        self.reference_shape = self.study_area_mask.shape
+
+        # Extract cell size from transform
+        if self.transform is not None:
+            self.cell_size = abs(self.transform[0])
+            print(f"Cell size extracted from data: {self.cell_size} meters")
+        else:
+            print("Warning: Could not extract cell size from transform, using default of 30m")
+            self.cell_size = 30
+
+        print(f"\nStudy area shape: {self.reference_shape}, valid pixels: {np.sum(self.study_area_mask):,}")
+
+        # Load start year
+        print(f"\nLoading {start_year}...")
+        start_path = Path(start_file_path)
+        if start_path.exists():
+            with rasterio.open(str(start_path)) as src:
+                arr = src.read(1)
+            aligned = StudyAreaHandler.align_to_study_area(arr, self.study_area_mask, self.reference_shape, fill_value=0)
+            urban_bin = (aligned == 1).astype(np.uint8)
+            urban_bin[~self.study_area_mask] = 0
+            self.data[f'urban_{start_year}'] = urban_bin
+            print(f"  ✓ {start_year} loaded: urban px = {np.sum(urban_bin):,}")
+        else:
+            print(f"  ✗ {start_file_path} not found")
+            print("  Please update the file path in the code.")
+
+        # Load end year
+        print(f"\nLoading {end_year}...")
+        end_path = Path(end_file_path)
+        if end_path.exists():
+            with rasterio.open(str(end_path)) as src:
+                arr = src.read(1)
+            aligned = StudyAreaHandler.align_to_study_area(arr, self.study_area_mask, self.reference_shape, fill_value=0)
+            urban_bin = (aligned == 1).astype(np.uint8)
+            urban_bin[~self.study_area_mask] = 0
+            self.data[f'urban_{end_year}'] = urban_bin
+            print(f"  ✓ {end_year} loaded: urban px = {np.sum(urban_bin):,}")
+        else:
+            print(f"  ✗ {end_file_path} not found")
+            print("  Please update the file path in the code.")
+
+    def save_geotiff(self, data, path, nodata_value=-9999):
+        if self.reference_meta is None:
+            np.save(path.with_suffix('.npy'), data)
+            print(f"  Warning: no meta, saved as {path.with_suffix('.npy')}")
+            return
+
+        dt = "float32"
+        data_out = data.copy()
+
+        if self.study_area_mask is not None:
+            data_out[~self.study_area_mask] = nodata_value
+
+        meta = self.reference_meta.copy()
+        meta.update({
+            "driver": "GTiff",
+            "dtype": dt,
+            "count": 1,
+            "height": data_out.shape[0],
+            "width": data_out.shape[1],
+            "nodata": nodata_value,
+            "compress": "lzw"
+        })
+
+        if self.transform is not None:
+            meta["transform"] = self.transform
+        if self.crs is not None:
+            meta["crs"] = self.crs
+
+        with rasterio.open(path, "w", **meta) as dst:
+            dst.write(data_out.astype(dt), 1)
+
+        print(f"  ✓ Saved {path.name}")
+
+def main():
+    # Data-driven years
+    start_year = 2017
+    end_year = 2024
+
+    print("=" * 80)
+    print(f"GVF ({start_year}-{end_year}) - corrected single-layer generation")
+    print("=" * 80)
+
+    print("\n" + "=" * 80)
+    print("IMPORTANT: Make sure you have updated the file paths in the code!")
+    print("Look for these lines in the DataLoader.load_urban_data() method:")
+    print("    start_file_path = 'Processed data/2017.tif'")
+    print("    end_file_path = 'Processed data/2024.tif'")
+    print("=" * 80 + "\n")
+
+    try:
+        loader = DataLoader("Processed data")
+        loader.load_urban_data(start_year, end_year)
+
+        required = [f'urban_{start_year}', f'urban_{end_year}']
+        missing = [r for r in required if r not in loader.data]
+        if missing:
+            print(f"\nError: Missing data layers: {missing}")
+            print("Please check that your file paths are correct and files exist.")
+            return
+
+        urban_start = loader.data[f'urban_{start_year}']
+        urban_end = loader.data[f'urban_{end_year}']
+        study_mask = loader.study_area_mask
+        cell_size = loader.cell_size
+
+        gvf_speed = GVFGeneratorCorrected.compute_gvf(
+            urban_start=urban_start,
+            urban_end=urban_end,
+            study_area_mask=study_mask,
+            start_year=start_year,
+            end_year=end_year,
+            cell_size=cell_size
+        )
+
+        # Save output - ONLY SPEED
+        loader.save_geotiff(gvf_speed, output_dir / "gvf_speed_2017_2024_corrected.tif")
+
+        # Simple report (console)
+        growth_mask = (urban_end == 1) & (urban_start == 0) & study_mask
+        print("\n" + "=" * 60)
+        print("FINAL REPORT")
+        print("=" * 60)
+        print(f"  Urban {start_year}: {np.sum(urban_start == 1):,} px")
+        print(f"  Urban {end_year}: {np.sum(urban_end == 1):,} px")
+        print(f"  Net-new {start_year}->{end_year}: {np.sum(growth_mask):,} px")
+
+        vals = gvf_speed[growth_mask]
+        vals = vals[vals != -9999]
+        if len(vals) > 0:
+            print(f"\n  Growth speed statistics:")
+            print(f"    Mean: {np.mean(vals):.2f} m/yr")
+            print(f"    Median: {np.median(vals):.2f} m/yr")
+            print(f"    Standard deviation: {np.std(vals):.2f} m/yr")
+            print(f"    Minimum: {np.min(vals):.2f} m/yr")
+            print(f"    Maximum: {np.max(vals):.2f} m/yr")
+            print(f"    25th percentile: {np.percentile(vals, 25):.2f} m/yr")
+            print(f"    75th percentile: {np.percentile(vals, 75):.2f} m/yr")
+            print(f"    95th percentile: {np.percentile(vals, 95):.2f} m/yr")
+
+        # =================================================================
+        # NEW: Compute the composite city-level GVF score
+        # =================================================================
+        if np.sum(growth_mask) > 0:
+            composite_gvf = np.mean(vals)   # mean speed of all new urban pixels
+        else:
+            composite_gvf = 0.0
+
+        print("\n" + "=" * 60)
+        print(f"FINAL COMPOSITE GVF SCORE (CITY-LEVEL): {composite_gvf:.2f} m/year")
+        print("=" * 60)
+        print("(Average expansion speed across all new urban pixels, representing")
+        print("the typical speed at which the urban footprint is growing outward.)")
+
+        print("\n" + "=" * 60)
+        print("✓ PROCESSING COMPLETE!")
+        print("=" * 60)
+        print(f"\nOutput saved to: {output_dir.absolute()}")
+        print(f"File name: gvf_speed_2017_2024_corrected.tif")
+
+    except Exception as e:
+        print("\n❌ ERROR:", e)
+        import traceback
+        traceback.print_exc()
+
+if __name__ == "__main__":
+    main()
