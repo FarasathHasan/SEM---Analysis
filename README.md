@@ -180,15 +180,6 @@ Score interpretation: **0 = compact / no sprawl**, **1 = maximum sprawl / disper
 
 **Composite integration** applies a PCA + entropy + CV ensemble weighting to the normalized six-indicator feature matrix, then trains an unsupervised VAE on that matrix. The reconstruction error coefficient of variation determines alpha, the modulation strength. Final score = clamp(weighted_sum × (1 + alpha × normalized_reconstruction_error), 0, 1).
 
----
-
-## Citation
-
-If you use this code in published research, please cite the associated manuscript:
-
-> [Author names]. *Urban Luminosity Morphology Integration Framework (ULMIF): Measuring Urban Sprawl and Growth Structure Across 154 Functional Urban Areas*. [Journal], [Year]. [DOI forthcoming]
-
----
 
 ## License
 
