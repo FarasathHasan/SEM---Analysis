@@ -1,0 +1,953 @@
+import os
+import json
+import gc
+import warnings
+import numpy as np
+import rasterio
+from rasterio.windows import Window
+from sklearn.decomposition import PCA
+from scipy.stats import entropy as scipy_entropy
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+from datetime import datetime
+
+warnings.filterwarnings("ignore")
+
+
+LAND_CONSUMPTION_PATH   = "LCE_results/land_consumption_efficiency_2017_2024.tif"
+GROWTH_MAGNITUDE_PATH   = "outputs_growth_magnitude/growth_magnitude_2017_2024_spatial.tif"
+GROWTH_SPEED_PATH       = "outputs_gvf_2017_2024_corrected/gvf_speed_2017_2024_corrected.tif"
+SPATIAL_COMPLEXITY_PATH = "outputs_smc/smc_new_growth_proxy_2017_2024.tif"
+SPRAWL_DISPERSION_PATH  = "outputs_urban_sprawl_dispersion/urban_sprawl_dispersion_2017_2024.tif"
+LUM_CHANGE_PATH         = "outputs_lum/lum_change_new_growth_2017_2024.tif"
+LULC_2017_PATH          = "Processed data/2017_cleaned.tif"
+LULC_2024_PATH          = "Processed data/2024_cleaned.tif"
+
+OUTPUT_DIRECTORY        = "sprawl_index_results"
+
+
+WINDOW_SIZE           = 1024
+MAX_NEW_URBAN_SAMPLES = 200_000
+MEMMAP_FEATURES_FILE  = os.path.join(OUTPUT_DIRECTORY, "si_features.memmap")
+MEMMAP_DTYPE          = np.float32
+OUT_NODATA            = -9999.0
+NODATA_SENTINELS      = {-9999.0, 9999.0, -3.4e38, 3.4e38}
+
+np.random.seed(42)
+torch.manual_seed(42)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Device: {device}")
+os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
+
+def is_nodata(array: np.ndarray, src_nodata=None) -> np.ndarray:
+    """Return boolean mask: True where pixel is invalid/nodata."""
+    bad = np.isnan(array) | np.isinf(array) | (np.abs(array) > 1e10)
+    for s in NODATA_SENTINELS:
+        bad |= (array == s)
+    if src_nodata is not None:
+        bad |= (array == src_nodata)
+    return bad
+
+
+def safe_normalize_01(array: np.ndarray, valid_mask: np.ndarray,
+                      lo_pct: float = 2.0, hi_pct: float = 98.0):
+    """
+    Normalize array to [0,1] using percentiles learned from valid pixels.
+    Returns normalized array and the learned (lo, hi) bounds.
+    """
+    vals = array[valid_mask]
+    if len(vals) == 0:
+        return np.zeros_like(array), (0.0, 1.0)
+
+    lo = float(np.percentile(vals, lo_pct))
+    hi = float(np.percentile(vals, hi_pct))
+
+    if hi <= lo:
+        return np.where(valid_mask, 0.5, 0.0), (lo, hi)
+
+    out = np.where(valid_mask, np.clip((array - lo) / (hi - lo), 0.0, 1.0), 0.0)
+    return out.astype(np.float32), (lo, hi)
+
+
+def georef_summary(src):
+    """Compact geospatial summary for error messages."""
+    return {
+        "crs": str(src.crs),
+        "transform": tuple(src.transform) if src.transform is not None else None,
+        "width": src.width,
+        "height": src.height,
+        "bounds": tuple(src.bounds) if src.bounds is not None else None,
+    }
+
+
+def assert_same_grid(reference, other, label: str):
+    """
+    Strictly ensure both rasters are on the same grid.
+    Raises ValueError if any mismatch is found.
+    """
+    problems = []
+
+    if reference.crs != other.crs:
+        problems.append(f"CRS mismatch: ref={reference.crs} other={other.crs}")
+
+    if reference.transform != other.transform:
+        problems.append(
+            f"Transform mismatch: ref={reference.transform} other={other.transform}"
+        )
+
+    if reference.width != other.width:
+        problems.append(f"Width mismatch: ref={reference.width} other={other.width}")
+
+    if reference.height != other.height:
+        problems.append(f"Height mismatch: ref={reference.height} other={other.height}")
+
+    if reference.bounds != other.bounds:
+        problems.append(f"Bounds mismatch: ref={reference.bounds} other={other.bounds}")
+
+    if problems:
+        msg = "\n  - ".join(problems)
+        raise ValueError(
+            f"Raster alignment check failed for '{label}'.\n"
+            f"All rasters must share the exact same grid.\n"
+            f"Problems:\n  - {msg}"
+        )
+
+def invert_lum_global(array: np.ndarray, valid_mask: np.ndarray,
+                      global_lo: float, global_hi: float) -> np.ndarray:
+    """
+    Invert LUM change values using pre-computed global min/max.
+    High original LUM (more mixing) -> low sprawl, so invert it so that
+    high values indicate more sprawl.
+    """
+    out = array.copy()
+    if global_hi > global_lo:
+        out[valid_mask] = global_hi - array[valid_mask] + global_lo
+    return out
+
+
+class DataDrivenWeightLearner:
+    """
+    Learn indicator weights from the actual joint distribution of
+    indicator values across all new-urban pixels.
+
+    Three methods, then ensemble them:
+      1. PCA loadings on PC1
+      2. Entropy weighting
+      3. CV weighting
+
+    No labels required.
+    """
+
+    def __init__(self, indicator_names: list):
+        self.names = indicator_names
+        self.weights_ = None
+        self.pca_weights_ = None
+        self.entropy_weights_ = None
+        self.cv_weights_ = None
+        self.ensemble_meta_ = None
+
+    def fit(self, X: np.ndarray) -> np.ndarray:
+        print("\n" + "=" * 70)
+        print("LEARNING INDICATOR WEIGHTS FROM DATA (unsupervised)")
+        print("=" * 70)
+
+        n, p = X.shape
+        print(f"  Fitting on {n:,} pixels × {p} indicators")
+
+        pca_w = self._pca_weights(X)
+        ent_w = self._entropy_weights(X)
+        cv_w  = self._cv_weights(X)
+
+        ens_w = self._meta_ensemble(pca_w, ent_w, cv_w)
+
+        final_w = (ens_w["pca"] * pca_w +
+                   ens_w["ent"] * ent_w +
+                   ens_w["cv"]  * cv_w)
+
+        final_sum = float(final_w.sum())
+        if final_sum > 0:
+            final_w = final_w / final_sum
+        else:
+            final_w = np.ones(len(pca_w), dtype=np.float32) / len(pca_w)
+
+        self.pca_weights_ = pca_w
+        self.entropy_weights_ = ent_w
+        self.cv_weights_ = cv_w
+        self.ensemble_meta_ = ens_w
+        self.weights_ = final_w
+
+        print(f"\n  {'Indicator':35s} {'PCA':>7s} {'Entropy':>7s} {'CV':>7s} {'FINAL':>7s}")
+        print(f"  {'-' * 65}")
+        for i, name in enumerate(self.names):
+            print(f"  {name:35s} {pca_w[i]:7.4f} {ent_w[i]:7.4f} {cv_w[i]:7.4f} {final_w[i]:7.4f}")
+        print(f"\n  Ensemble meta-weights: "
+              f"PCA={ens_w['pca']:.4f}  Entropy={ens_w['ent']:.4f}  CV={ens_w['cv']:.4f}")
+
+        return final_w
+
+    def _pca_weights(self, X: np.ndarray) -> np.ndarray:
+        """PC1 absolute loadings — direction of maximum variance."""
+        if X.shape[0] < 2 or np.allclose(np.std(X, axis=0), 0):
+            return np.ones(X.shape[1], dtype=np.float32) / X.shape[1]
+
+        pca = PCA(n_components=min(X.shape[1], X.shape[0], 10))
+        pca.fit(X)
+        loadings = np.abs(pca.components_[0])
+        s = float(loadings.sum())
+        if s <= 0:
+            return np.ones(X.shape[1], dtype=np.float32) / X.shape[1]
+        w = loadings / s
+        print(f"  PCA  — PC1 explains {pca.explained_variance_ratio_[0] * 100:.1f}% variance")
+        return w
+
+    def _entropy_weights(self, X: np.ndarray) -> np.ndarray:
+        """Shannon entropy of each indicator's histogram — more spread = more info."""
+        weights = []
+        for i in range(X.shape[1]):
+            hist, _ = np.histogram(X[:, i], bins=50, range=(0.0, 1.0))
+            hist = hist + 1e-12
+            prob = hist / hist.sum()
+            h = float(scipy_entropy(prob))
+            weights.append(h)
+
+        w = np.array(weights, dtype=np.float32)
+        s = float(w.sum())
+        if s > 0:
+            w = w / s
+        else:
+            w = np.ones(len(w), dtype=np.float32) / len(w)
+        return w
+
+    def _cv_weights(self, X: np.ndarray) -> np.ndarray:
+        """Coefficient of variation — indicators that vary more get more weight."""
+        weights = []
+        for i in range(X.shape[1]):
+            mu = float(np.mean(X[:, i]))
+            sig = float(np.std(X[:, i]))
+            cv = sig / mu if mu > 1e-9 else 0.0
+            weights.append(cv)
+
+        w = np.array(weights, dtype=np.float32)
+        s = float(w.sum())
+        if s > 0:
+            w = w / s
+        else:
+            w = np.ones(len(w), dtype=np.float32) / len(w)
+        return w
+
+    def _meta_ensemble(self, pca_w, ent_w, cv_w) -> dict:
+        """
+        Weight each method by agreement and stability.
+        """
+        methods = {"pca": pca_w, "ent": ent_w, "cv": cv_w}
+        names = list(methods.keys())
+
+        vecs = np.vstack([methods[n] for n in names])
+        corr_matrix = np.corrcoef(vecs)
+        corr_matrix = np.nan_to_num(corr_matrix, nan=0.0, posinf=0.0, neginf=0.0)
+
+        agree = {}
+        for i, n in enumerate(names):
+            others = [j for j in range(len(names)) if j != i]
+            agree[n] = float(np.mean([corr_matrix[i, j] for j in others]))
+
+        stab = {}
+        for n in names:
+            stab[n] = 1.0 / (float(np.std(methods[n])) + 1e-9)
+
+        raw = {n: max(0.0, agree[n]) * stab[n] for n in names}
+        total = sum(raw.values())
+        if total > 0:
+            meta = {n: raw[n] / total for n in names}
+        else:
+            meta = {n: 1 / 3 for n in names}
+
+        return meta
+
+
+class SprawlVAE(nn.Module):
+    """
+    Variational Autoencoder trained UNSUPERVISED on indicator vectors.
+    """
+
+    def __init__(self, input_dim: int, hidden_sizes: list, latent_dim: int):
+        super().__init__()
+
+        enc_layers = []
+        prev = input_dim
+        for h in hidden_sizes:
+            enc_layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.1)]
+            prev = h
+        self.encoder_body = nn.Sequential(*enc_layers)
+        self.z_mean = nn.Linear(prev, latent_dim)
+        self.z_log_var = nn.Linear(prev, latent_dim)
+
+        dec_layers = []
+        prev = latent_dim
+        for h in reversed(hidden_sizes):
+            dec_layers += [nn.Linear(prev, h), nn.BatchNorm1d(h), nn.ReLU(), nn.Dropout(0.1)]
+            prev = h
+        dec_layers += [nn.Linear(prev, input_dim), nn.Sigmoid()]
+        self.decoder = nn.Sequential(*dec_layers)
+
+    def encode(self, x):
+        h = self.encoder_body(x)
+        return self.z_mean(h), self.z_log_var(h)
+
+    def reparameterize(self, mu, log_var):
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+
+    def decode(self, z):
+        return self.decoder(z)
+
+    def forward(self, x):
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        recon = self.decode(z)
+        return recon, mu, log_var
+
+    @staticmethod
+    def vae_loss(recon, x, mu, log_var, kl_weight: float):
+        recon_loss = F.mse_loss(recon, x, reduction="mean")
+        kl_loss = -0.5 * torch.mean(1 + log_var - mu.pow(2) - log_var.exp())
+        return recon_loss + kl_weight * kl_loss, recon_loss, kl_loss
+
+
+def learn_vae_architecture(n_features: int, n_samples: int) -> dict:
+    latent_dim = max(2, n_features // 2)
+    n_layers = 2 if n_features <= 8 else 3
+    base_h = int(np.clip(np.sqrt(max(n_samples, 1)) / 10, 16, 128))
+    hidden_sizes = [base_h * (2 ** i) for i in range(n_layers - 1, -1, -1)]
+
+    print(f"\n  Learned VAE architecture:")
+    print(f"    Input dim:    {n_features}")
+    print(f"    Hidden sizes: {hidden_sizes}")
+    print(f"    Latent dim:   {latent_dim}")
+
+    return {"hidden_sizes": hidden_sizes, "latent_dim": latent_dim}
+
+
+class NumpyDataset(Dataset):
+    def __init__(self, X: np.ndarray):
+        self.X = torch.from_numpy(X.astype(np.float32))
+
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx]
+
+
+def train_vae_unsupervised(X: np.ndarray, arch: dict,
+                           epochs: int = 30,
+                           batch_size: int = 512) -> tuple:
+    print("\n" + "=" * 70)
+    print("TRAINING UNSUPERVISED VAE")
+    print("=" * 70)
+    print(f"  Samples: {len(X):,} | Epochs: {epochs} | Batch: {batch_size}")
+
+    model = SprawlVAE(
+        input_dim=X.shape[1],
+        hidden_sizes=arch["hidden_sizes"],
+        latent_dim=arch["latent_dim"]
+    ).to(device)
+
+    opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    step_size = max(5, epochs // 3)
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=step_size, gamma=0.5)
+
+    ds = NumpyDataset(X)
+    loader = DataLoader(ds, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=False)
+
+    data_var = float(np.var(X))
+    kl_ceiling = float(np.clip(data_var * 0.1, 1e-4, 0.1))
+    print(f"  Data variance: {data_var:.4f} → learned KL ceiling: {kl_ceiling:.6f}")
+
+    history = []
+    for ep in range(epochs):
+        kl_weight = kl_ceiling * min(1.0, (ep + 1) / (epochs / 2))
+        model.train()
+        ep_loss = ep_recon = ep_kl = 0.0
+        n_batches = 0
+
+        for batch in loader:
+            batch = batch.to(device)
+            opt.zero_grad()
+            recon, mu, log_var = model(batch)
+            loss, rl, kl = SprawlVAE.vae_loss(recon, batch, mu, log_var, kl_weight)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            opt.step()
+
+            ep_loss += loss.item()
+            ep_recon += rl.item()
+            ep_kl += kl.item()
+            n_batches += 1
+
+        scheduler.step()
+
+        avg_loss = ep_loss / max(1, n_batches)
+        avg_recon = ep_recon / max(1, n_batches)
+        avg_kl = ep_kl / max(1, n_batches)
+        history.append(avg_loss)
+
+        if (ep + 1) % max(1, epochs // 5) == 0:
+            print(f"  Epoch {ep + 1:3d}/{epochs} | Loss={avg_loss:.5f} "
+                  f"Recon={avg_recon:.5f}  KL={avg_kl:.6f}  kl_w={kl_weight:.5f}")
+
+    model.eval()
+    recon_errors = []
+    with torch.no_grad():
+        for i in range(0, len(X), 4096):
+            batch = torch.from_numpy(X[i:i + 4096].astype(np.float32)).to(device)
+            recon, _, _ = model(batch)
+            err = F.mse_loss(recon, batch, reduction="none").mean(dim=1)
+            recon_errors.append(err.cpu().numpy())
+
+    recon_errors = np.concatenate(recon_errors)
+
+    print(f"\n  Reconstruction error stats:")
+    print(f"    Mean:   {np.mean(recon_errors):.6f}")
+    print(f"    Std:    {np.std(recon_errors):.6f}")
+    print(f"    Range:  [{np.min(recon_errors):.6f}, {np.max(recon_errors):.6f}]")
+
+    return model, recon_errors
+
+
+def learn_alpha_modulation(recon_errors: np.ndarray) -> float:
+    """
+    Alpha controls how much reconstruction complexity modulates the score.
+    """
+    mu = np.mean(recon_errors)
+    sig = np.std(recon_errors)
+    cv = sig / mu if mu > 1e-9 else 0.0
+    alpha = float(np.clip(cv, 0.05, 0.5))
+    print(f"\n  Learned alpha (complexity modulation): {alpha:.4f}")
+    print(f"  (from reconstruction error CV = {cv:.4f})")
+    return alpha
+
+
+class UrbanSprawlIndexFramework:
+
+    INDICATOR_NAMES = [
+        "land_consumption_efficiency",
+        "growth_magnitude",
+        "growth_speed",
+        "spatial_complexity",
+        "sprawl_dispersion",
+        "lum_change",
+    ]
+
+    def __init__(self):
+        self.indicator_paths = {
+            "land_consumption_efficiency": LAND_CONSUMPTION_PATH,
+            "growth_magnitude": GROWTH_MAGNITUDE_PATH,
+            "growth_speed": GROWTH_SPEED_PATH,
+            "spatial_complexity": SPATIAL_COMPLEXITY_PATH,
+            "sprawl_dispersion": SPRAWL_DISPERSION_PATH,
+            "lum_change": LUM_CHANGE_PATH,
+        }
+        self.nodata_vals = {}
+        self.norm_bounds = {}
+        self.lum_inv_bounds = None
+        self.scaler = None
+        self.weights = None
+        self.vae_model = None
+        self.alpha = None
+        self.recon_error_bounds = None
+        self.meta = {}
+        self.raster_meta = None
+
+  
+    def load_metadata(self):
+        print("\n" + "=" * 70)
+        print("LOADING METADATA & VERIFYING RASTER ALIGNMENT")
+        print("=" * 70)
+
+        # Use 2024 LULC as the grid reference
+        with rasterio.open(LULC_2024_PATH) as ref:
+            self.raster_meta = {
+                "transform": ref.transform,
+                "crs": ref.crs,
+                "height": ref.height,
+                "width": ref.width,
+                "bounds": ref.bounds,
+            }
+            print(f"  Reference grid: {LULC_2024_PATH}")
+            print(f"    CRS:       {ref.crs}")
+            print(f"    Transform: {ref.transform}")
+            print(f"    Size:      {ref.width} x {ref.height}")
+            print(f"    Bounds:    {ref.bounds}")
+
+        # Validate 2017 LULC against 2024 LULC
+        with rasterio.open(LULC_2017_PATH) as src17:
+            assert_same_grid(
+                reference=rasterio.open(LULC_2024_PATH),
+                other=src17,
+                label="LULC_2017 vs LULC_2024"
+            )
+
+        # Validate each indicator raster against the reference grid
+        for name, path in self.indicator_paths.items():
+            with rasterio.open(path) as src:
+                self.nodata_vals[name] = src.nodata
+                assert_same_grid(
+                    reference=rasterio.open(LULC_2024_PATH),
+                    other=src,
+                    label=f"Indicator '{name}'"
+                )
+                print(f"  {name:40s} nodata={src.nodata}")
+
+        print("\n  All rasters are on the exact same grid.")
+        print("  Proceeding with analysis.")
+
+
+    def collect_features(self, max_samples: int = MAX_NEW_URBAN_SAMPLES) -> np.ndarray:
+        print("\n" + "=" * 70)
+        print("COLLECTING FEATURE MATRIX (new-urban pixels, windowed reads)")
+        print("=" * 70)
+
+        h = self.raster_meta["height"]
+        w = self.raster_meta["width"]
+        p = len(self.INDICATOR_NAMES)
+
+        global_indices = []
+        total_lum_vals = []
+
+        ind_ds = {n: rasterio.open(self.indicator_paths[n]) for n in self.INDICATOR_NAMES}
+
+        try:
+            with rasterio.open(LULC_2017_PATH) as s17, rasterio.open(LULC_2024_PATH) as s24:
+                for ro in range(0, h, WINDOW_SIZE):
+                    rh = min(WINDOW_SIZE, h - ro)
+                    for co in range(0, w, WINDOW_SIZE):
+                        cw = min(WINDOW_SIZE, w - co)
+                        win = Window(co, ro, cw, rh)
+
+                        lu17 = s17.read(1, window=win)
+                        lu24 = s24.read(1, window=win)
+                        new_mask = (lu24 == 1) & (lu17 != 1)
+
+                        if not new_mask.any():
+                            continue
+
+                        combined_valid = np.ones((rh, cw), dtype=bool)
+                        lum_raw = None
+
+                        for name in self.INDICATOR_NAMES:
+                            arr = ind_ds[name].read(1, window=win).astype(np.float32)
+                            bad = is_nodata(arr, self.nodata_vals[name])
+                            combined_valid &= (~bad)
+                            if name == "lum_change":
+                                lum_raw = arr.copy()
+
+                        new_flat = new_mask & combined_valid
+                        valid_rows, valid_cols = np.where(new_flat)
+
+                        for r, c in zip(valid_rows, valid_cols):
+                            global_indices.append((ro + r, co + c))
+                            if lum_raw is not None:
+                                total_lum_vals.append(lum_raw[r, c])
+
+        finally:
+            for ds in ind_ds.values():
+                ds.close()
+
+        total_valid = len(global_indices)
+        print(f"  Found {total_valid:,} valid new-urban pixels in total.")
+
+        if total_valid == 0:
+            print("  No valid new-urban pixels!")
+            return np.empty((0, p), dtype=np.float32)
+
+        if len(total_lum_vals) > 0:
+            global_lo = float(np.min(total_lum_vals))
+            global_hi = float(np.max(total_lum_vals))
+        else:
+            global_lo, global_hi = 0.0, 1.0
+
+        self.lum_inv_bounds = (global_lo, global_hi)
+        print(f"  Global LUM inversion bounds: [{global_lo:.4f}, {global_hi:.4f}]")
+
+        if total_valid > max_samples:
+            chosen_idx = np.random.choice(total_valid, size=max_samples, replace=False)
+            chosen_set = set(chosen_idx.tolist())
+            filled_target = max_samples
+        else:
+            chosen_set = set(range(total_valid))
+            filled_target = total_valid
+
+        from collections import defaultdict
+        window_dict = defaultdict(list)
+        for idx in chosen_set:
+            row, col = global_indices[idx]
+            win_ro = (row // WINDOW_SIZE) * WINDOW_SIZE
+            win_co = (col // WINDOW_SIZE) * WINDOW_SIZE
+            local_r = row - win_ro
+            local_c = col - win_co
+            window_dict[(win_ro, win_co)].append((local_r, local_c))
+
+        mm = np.memmap(
+            MEMMAP_FEATURES_FILE,
+            mode="w+",
+            dtype=MEMMAP_DTYPE,
+            shape=(filled_target, p)
+        )
+
+        filled = 0
+        ind_ds = {n: rasterio.open(self.indicator_paths[n]) for n in self.INDICATOR_NAMES}
+
+        try:
+            with rasterio.open(LULC_2017_PATH) as s17, rasterio.open(LULC_2024_PATH) as s24:
+                for ro in range(0, h, WINDOW_SIZE):
+                    if filled >= filled_target:
+                        break
+                    rh = min(WINDOW_SIZE, h - ro)
+                    for co in range(0, w, WINDOW_SIZE):
+                        if filled >= filled_target:
+                            break
+
+                        key = (ro, co)
+                        if key not in window_dict:
+                            continue
+
+                        local_positions = window_dict[key]
+                        cw = min(WINDOW_SIZE, w - co)
+                        win = Window(co, ro, cw, rh)
+
+                        stack = np.zeros((p, rh, cw), dtype=np.float32)
+                        combined_valid = np.ones((rh, cw), dtype=bool)
+
+                        for i, name in enumerate(self.INDICATOR_NAMES):
+                            arr = ind_ds[name].read(1, window=win).astype(np.float32)
+                            bad = is_nodata(arr, self.nodata_vals[name])
+                            arr[bad] = 0.0
+                            stack[i] = arr
+                            combined_valid &= (~bad)
+
+                        for local_r, local_c in local_positions:
+                            if combined_valid[local_r, local_c]:
+                                feat = stack[:, local_r, local_c]
+                                mm[filled] = feat
+                                filled += 1
+                                if filled >= filled_target:
+                                    break
+
+        finally:
+            for ds in ind_ds.values():
+                ds.close()
+
+        X = np.array(mm[:filled])
+        del mm
+        gc.collect()
+        try:
+            os.remove(MEMMAP_FEATURES_FILE)
+        except Exception:
+            pass
+
+        print(f"\n  Collected {filled:,} valid new-urban pixel feature vectors")
+        for i, name in enumerate(self.INDICATOR_NAMES):
+            col = X[:, i]
+            print(f"  {name:40s} [{col.min():.4f}, {col.max():.4f}]  "
+                  f"mean={col.mean():.4f}  std={col.std():.4f}")
+
+        return X
+
+
+    def normalize_features(self, X_raw: np.ndarray) -> np.ndarray:
+        print("\n" + "=" * 70)
+        print("NORMALIZING FEATURES (data-driven percentile bounds)")
+        print("=" * 70)
+
+        X_norm = np.zeros_like(X_raw, dtype=np.float32)
+
+        for i, name in enumerate(self.INDICATOR_NAMES):
+            col = X_raw[:, i].copy()
+            valid = np.ones(len(col), dtype=bool)
+
+            if name == "lum_change":
+                lo, hi = self.lum_inv_bounds
+                col = invert_lum_global(col, valid, lo, hi)
+                X_raw[:, i] = col
+
+            norm_col, (lo, hi) = safe_normalize_01(col, valid)
+            X_norm[:, i] = norm_col
+            self.norm_bounds[name] = (lo, hi)
+            print(f"  {name:40s} learned range [{lo:.4f}, {hi:.4f}]")
+
+        return X_norm
+
+    # ------------------------------------------------------------------ #
+    # 4. Learn weights from normalized data
+    # ------------------------------------------------------------------ #
+    def learn_weights(self, X_norm: np.ndarray) -> np.ndarray:
+        learner = DataDrivenWeightLearner(self.INDICATOR_NAMES)
+        self.weights = learner.fit(X_norm)
+        self.meta["weight_learner"] = {
+            "pca_weights": learner.pca_weights_.tolist(),
+            "entropy_weights": learner.entropy_weights_.tolist(),
+            "cv_weights": learner.cv_weights_.tolist(),
+            "ensemble_meta": learner.ensemble_meta_,
+            "final_weights": self.weights.tolist(),
+        }
+        return self.weights
+
+
+    def learn_vae_and_alpha(self, X_norm: np.ndarray):
+        arch = learn_vae_architecture(X_norm.shape[1], X_norm.shape[0])
+
+        epochs = int(np.clip(30 - np.log10(max(len(X_norm), 1)) * 3, 10, 30))
+        print(f"  Learned epoch count: {epochs}")
+
+        batch_size = int(np.clip(len(X_norm) / 200, 128, 1024))
+        print(f"  Learned batch size:  {batch_size}")
+
+        self.vae_model, recon_errors = train_vae_unsupervised(
+            X_norm, arch, epochs=epochs, batch_size=batch_size
+        )
+        self.alpha = learn_alpha_modulation(recon_errors)
+
+        re_lo = float(np.percentile(recon_errors, 2))
+        re_hi = float(np.percentile(recon_errors, 98))
+        self.recon_error_bounds = (re_lo, re_hi)
+        print(f"  Global reconstruction error percentiles (2, 98): [{re_lo:.6f}, {re_hi:.6f}]")
+
+        self.meta["vae"] = {
+            "architecture": arch,
+            "epochs": epochs,
+            "batch_size": batch_size,
+            "alpha_modulation": self.alpha,
+            "mean_recon_error": float(np.mean(recon_errors)),
+            "std_recon_error": float(np.std(recon_errors)),
+            "global_recon_percentiles": [re_lo, re_hi],
+        }
+        return recon_errors
+
+
+    def _compute_scores(self, X_norm: np.ndarray):
+        """
+        Composite score = weighted sum of indicator values.
+        Modulated by normalized reconstruction error.
+        Final = clip(composite * (1 + alpha * norm_error), 0, 1)
+        """
+        composite = (X_norm * self.weights[np.newaxis, :]).sum(axis=1)
+
+        self.vae_model.eval()
+        recon_errors = []
+        with torch.no_grad():
+            for i in range(0, len(X_norm), 4096):
+                batch = torch.from_numpy(X_norm[i:i + 4096].astype(np.float32)).to(device)
+                recon, _, _ = self.vae_model(batch)
+                err = F.mse_loss(recon, batch, reduction="none").mean(dim=1)
+                recon_errors.append(err.cpu().numpy())
+        recon_errors = np.concatenate(recon_errors)
+
+        re_lo, re_hi = self.recon_error_bounds
+        if re_hi > re_lo:
+            norm_re = np.clip((recon_errors - re_lo) / (re_hi - re_lo), 0.0, 1.0)
+        else:
+            norm_re = np.zeros_like(recon_errors)
+
+        final = composite * (1.0 + self.alpha * norm_re)
+        final = np.clip(final, 0.0, 1.0).astype(np.float32)
+
+        return final, composite.astype(np.float32), norm_re.astype(np.float32)
+
+
+    def predict_and_write(self) -> float:
+        print("\n" + "=" * 70)
+        print("INFERENCE — WRITING SPATIAL SPRAWL INDEX TIFF")
+        print("=" * 70)
+
+        h = self.raster_meta["height"]
+        w = self.raster_meta["width"]
+        p = len(self.INDICATOR_NAMES)
+        out_path = os.path.join(OUTPUT_DIRECTORY, "sprawl_index_spatial_map.tif")
+
+        profile = {
+            "driver": "GTiff",
+            "height": h,
+            "width": w,
+            "count": 1,
+            "dtype": "float32",
+            "crs": self.raster_meta["crs"],
+            "transform": self.raster_meta["transform"],
+            "compress": "lzw",
+            "nodata": OUT_NODATA,
+        }
+
+        all_scores = []
+
+        ind_ds = {n: rasterio.open(self.indicator_paths[n]) for n in self.INDICATOR_NAMES}
+        lum_lo, lum_hi = self.lum_inv_bounds
+
+        with rasterio.open(out_path, "w", **profile) as dst, \
+             rasterio.open(LULC_2017_PATH) as s17, \
+             rasterio.open(LULC_2024_PATH) as s24:
+
+            for ro in tqdm(range(0, h, WINDOW_SIZE), desc="Writing windows"):
+                rh = min(WINDOW_SIZE, h - ro)
+                for co in range(0, w, WINDOW_SIZE):
+                    cw = min(WINDOW_SIZE, w - co)
+                    win = Window(co, ro, cw, rh)
+
+                    lu17 = s17.read(1, window=win)
+                    lu24 = s24.read(1, window=win)
+                    new_mask = (lu24 == 1) & (lu17 != 1)
+
+                    win_out = np.full(rh * cw, OUT_NODATA, dtype=np.float32)
+
+                    if not new_mask.any():
+                        dst.write(win_out.reshape(rh, cw), 1, window=win)
+                        continue
+
+                    stack = np.zeros((p, rh * cw), dtype=np.float32)
+                    combined_valid = np.ones(rh * cw, dtype=bool)
+
+                    for i, name in enumerate(self.INDICATOR_NAMES):
+                        arr = ind_ds[name].read(1, window=win).astype(np.float32)
+                        bad = is_nodata(arr, self.nodata_vals[name])
+
+                        if name == "lum_change":
+                            arr = invert_lum_global(arr, ~bad, lum_lo, lum_hi)
+
+                        arr[bad] = 0.0
+                        stack[i] = arr.reshape(-1)
+                        combined_valid &= (~bad).reshape(-1)
+
+                    new_flat = new_mask.reshape(-1)
+                    valid_new = np.where(new_flat & combined_valid)[0]
+
+                    if len(valid_new) == 0:
+                        dst.write(win_out.reshape(rh, cw), 1, window=win)
+                        continue
+
+                    X_raw = stack[:, valid_new].T
+                    X_norm = np.zeros_like(X_raw, dtype=np.float32)
+
+                    for i, name in enumerate(self.INDICATOR_NAMES):
+                        lo, hi = self.norm_bounds[name]
+                        if hi > lo:
+                            X_norm[:, i] = np.clip((X_raw[:, i] - lo) / (hi - lo), 0.0, 1.0)
+                        else:
+                            X_norm[:, i] = 0.5
+
+                    scores, _, _ = self._compute_scores(X_norm)
+                    win_out[valid_new] = scores
+                    all_scores.append(scores)
+
+                    dst.write(win_out.reshape(rh, cw), 1, window=win)
+
+        for ds in ind_ds.values():
+            ds.close()
+
+        if not all_scores:
+            print("  No new-urban pixels found!")
+            return 0.0
+
+        all_scores = np.concatenate(all_scores)
+        all_scores = all_scores[np.isfinite(all_scores)]
+
+        city_score = float(np.mean(all_scores))
+        city_median = float(np.median(all_scores))
+        city_p25 = float(np.percentile(all_scores, 25))
+        city_p75 = float(np.percentile(all_scores, 75))
+        city_std = float(np.std(all_scores))
+
+        print(f"\n  Sprawl index statistics across {len(all_scores):,} pixels:")
+        print(f"    Mean (city score):  {city_score:.4f}")
+        print(f"    Median:             {city_median:.4f}")
+        print(f"    25th–75th pctl:     [{city_p25:.4f}, {city_p75:.4f}]")
+        print(f"    Std:                {city_std:.4f}")
+        print(f"\n  Output: {out_path}")
+
+        self.meta["city_level_scores"] = {
+            "mean": round(city_score, 6),
+            "median": round(city_median, 6),
+            "p25": round(city_p25, 6),
+            "p75": round(city_p75, 6),
+            "std": round(city_std, 6),
+            "n_pixels": int(len(all_scores)),
+        }
+
+        return city_score
+
+
+    def save_report(self, city_score: float):
+        report = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "city_sprawl_index": round(city_score, 6),
+            "indicator_weights": {
+                n: round(float(w), 6)
+                for n, w in zip(self.INDICATOR_NAMES, self.weights)
+            },
+            "normalization_bounds": {
+                n: {"lo": round(lo, 6), "hi": round(hi, 6)}
+                for n, (lo, hi) in self.norm_bounds.items()
+            },
+            "global_lum_inversion_bounds": {
+                "lo": self.lum_inv_bounds[0],
+                "hi": self.lum_inv_bounds[1]
+            },
+            "global_recon_error_bounds": {
+                "lo": self.recon_error_bounds[0],
+                "hi": self.recon_error_bounds[1]
+            },
+            "learned_parameters": self.meta,
+            "interpretation": (
+                "0 = no sprawl / compact; 1 = maximum sprawl / dispersed. "
+                "Score derived from data-driven weighted composite of 6 indicators "
+                "modulated by VAE reconstruction complexity. "
+                "All weights and normalization bounds learned from data."
+            ),
+        }
+
+        report_path = os.path.join(OUTPUT_DIRECTORY, "sprawl_index_report.json")
+        with open(report_path, "w") as f:
+            json.dump(report, f, indent=2)
+
+        print(f"\n  Report saved: {report_path}")
+
+
+    def run(self) -> float:
+        print("=" * 70)
+        print("URBAN SPRAWL INDEX — FULLY DATA-DRIVEN (CORRECTED)")
+        print("=" * 70)
+        print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+        self.load_metadata()
+
+        X_raw = self.collect_features()
+        if len(X_raw) == 0:
+            print("ERROR: No valid new-urban pixels found.")
+            return 0.0
+
+        X_norm = self.normalize_features(X_raw)
+        self.learn_weights(X_norm)
+        self.learn_vae_and_alpha(X_norm)
+
+        city_score = self.predict_and_write()
+        self.save_report(city_score)
+
+        print("\n" + "=" * 70)
+        print(f"FINAL CITY-LEVEL SPRAWL INDEX: {city_score:.4f}")
+        print("=" * 70)
+        print("\nINDICATOR WEIGHTS (learned from data):")
+        for name, w in zip(self.INDICATOR_NAMES, self.weights):
+            print(f"  {name:40s} {w:.4f}")
+        print(f"\nEnd: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+        return city_score
+
+
+if __name__ == "__main__":
+    framework = UrbanSprawlIndexFramework()
+    score = framework.run()
+    print(f"\n{'=' * 70}")
+    print(f"SPRAWL INDEX: {score:.4f}")
+    print(f"{'=' * 70}")
