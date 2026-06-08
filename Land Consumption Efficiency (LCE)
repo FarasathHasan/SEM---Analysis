@@ -1,0 +1,530 @@
+import numpy as np
+import rasterio
+import os
+import csv
+from scipy import ndimage
+from scipy.stats import variation
+import warnings
+from datetime import datetime
+import json
+warnings.filterwarnings('ignore')
+
+
+# Land‑use / final grid properties (hard‑coded because they define the analysis)
+LU_PIXEL_SIZE = 10.0          # metres
+PIXEL_AREA_HA = 0.01          # 10m × 10m = 0.01 ha
+
+# NoData / extreme‑value thresholds (still reasonable defaults)
+POP_NODATA_THRESHOLD = -1e10
+POP_EXTREME_HIGH     = 1e20
+
+# Analysis period
+YEAR_START = 2017
+YEAR_END   = 2024
+TIME_PERIOD = YEAR_END - YEAR_START
+
+
+def read_geotiff(filepath):
+    """Read a GeoTIFF and return array + metadata."""
+    try:
+        with rasterio.open(filepath) as src:
+            array = src.read(1)
+            profile = src.profile.copy()
+            transform = src.transform
+            crs = src.crs
+            bounds = src.bounds
+            print(f"✓ {os.path.basename(filepath):30s} | "
+                  f"Shape: {str(array.shape):15s} | "
+                  f"CRS: {str(crs):20s} | "
+                  f"Range: [{array.min():12.1f}, {array.max():12.1f}]")
+            return array, profile, transform, crs, bounds
+    except Exception as e:
+        print(f"✗ ERROR reading {filepath}: {str(e)}")
+        raise
+
+def write_geotiff(output_path, array, reference_profile, nodata_value=-9999, compress=True):
+    """Write a GeoTIFF using a reference profile for georeferencing."""
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    profile = reference_profile.copy()
+    profile.update({
+        'driver': 'GTiff',
+        'height': array.shape[0],
+        'width': array.shape[1],
+        'count': 1,
+        'dtype': array.dtype,
+        'nodata': nodata_value,
+        'compress': 'lzw' if compress else 'none',
+        'tiled': True,
+        'blockxsize': 256,
+        'blockysize': 256
+    })
+    with rasterio.open(output_path, 'w', **profile) as dst:
+        dst.write(array.astype(profile['dtype']), 1)
+    file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+    print(f"✓ Saved: {os.path.basename(output_path)} "
+          f"({file_size_mb:.2f} MB, CRS: {profile['crs']})")
+
+def learn_population_range(pop_arrays):
+    """Learn valid population value range from the data (1st‑99th percentile)."""
+    print("\n📚 Learning population value range from data...")
+    all_valid = []
+    for arr in pop_arrays:
+        mask = (arr > POP_NODATA_THRESHOLD) & (arr < POP_EXTREME_HIGH)
+        if mask.any():
+            all_valid.extend(arr[mask].flatten())
+    if not all_valid:
+        print("   Fallback range [0, 50]")
+        return 0.0, 50.0
+    all_valid = np.array(all_valid)
+    p1 = np.percentile(all_valid, 1)
+    p99 = np.percentile(all_valid, 99)
+    pop_min = max(0.0, p1)
+    pop_max = p99 * 1.5
+    print(f"   Range: [{pop_min:.4f}, {pop_max:.4f}] people/pixel "
+          f"(1st={p1:.4f}, 99th={p99:.4f})")
+    return pop_min, pop_max
+
+def clean_population_array(pop_array, pop_min, pop_max, year_label):
+    """Clip extreme values and enforce learned bounds."""
+    print(f"\n🧹 Cleaning {year_label} population data...")
+    pop = pop_array.copy().astype(np.float32)
+    # Remove extreme nodata
+    pop[pop < POP_NODATA_THRESHOLD] = 0.0
+    pop[pop > POP_EXTREME_HIGH] = 0.0
+    # Clamp to learned range
+    pop = np.clip(pop, pop_min, pop_max)
+
+    valid = pop > 0
+    if valid.any():
+        print(f"   Valid pixels: {valid.sum():,} "
+              f"({valid.sum()/pop.size*100:.1f}%)")
+        print(f"   Total population: {pop.sum():,.0f}")
+        print(f"   Mean density: {pop[valid].mean():.3f} people/pixel")
+    else:
+        print("   No positive population values found.")
+    return pop
+
+
+def extract_urban_mask(lu_array, year_label):
+    """Extract binary urban mask (class == 1)."""
+    print(f"\n🗺️  Processing {year_label} land use data...")
+    urban = (lu_array == 1)
+    print(f"   Urban pixels: {urban.sum():,} "
+          f"({urban.sum()/urban.size*100:.1f}%)")
+    print(f"   Urban area: {urban.sum() * PIXEL_AREA_HA:,.2f} ha")
+    return urban
+
+
+def analyze_urban_changes(urban_2017, urban_2024):
+    """Compute new urban area and basic statistics."""
+    print("\n" + "="*80)
+    print("URBAN CHANGE ANALYSIS")
+    print("="*80)
+    new_urban = urban_2024 & (~urban_2017)
+    print(f"\n📊 Urban Area Statistics:")
+    print(f"   Urban 2017:         {urban_2017.sum():9,} pixels = "
+          f"{urban_2017.sum()*PIXEL_AREA_HA:10,.2f} ha")
+    print(f"   Urban 2024:         {urban_2024.sum():9,} pixels = "
+          f"{urban_2024.sum()*PIXEL_AREA_HA:10,.2f} ha")
+    print(f"   New urban (2017-2024): {new_urban.sum():9,} pixels = "
+          f"{new_urban.sum()*PIXEL_AREA_HA:10,.2f} ha")
+    if new_urban.sum() > 0:
+        ann_rate = new_urban.sum() * PIXEL_AREA_HA / TIME_PERIOD
+        print(f"\n📈 Urbanization Rate: {ann_rate:8,.2f} ha/year")
+    return {
+        'new_urban': new_urban,
+        'urban_2017': urban_2017,
+        'urban_2024': urban_2024,
+        'time_period': TIME_PERIOD
+    }
+
+
+def learn_window_size_optimized(new_urban_mask, existing_urban, sample_fraction=0.1):
+    print("\n📐 Learning optimal window size from urban growth pattern...")
+    downsample_factor = 10
+    new_urban_ds = new_urban_mask[::downsample_factor, ::downsample_factor]
+    from scipy.ndimage import label
+    labeled, num_feat = label(new_urban_ds)
+    if num_feat > 0:
+        sizes = np.bincount(labeled.ravel())[1:]
+        if len(sizes) > 0:
+            p75 = np.percentile(sizes, 75)
+            win_ds = int(np.sqrt(p75) * 3)
+            win = win_ds * downsample_factor
+            win = max(11, min(win, 101))
+            if win % 2 == 0:
+                win += 1
+        else:
+            win = 51
+    else:
+        win = _learn_window_via_sampling(new_urban_mask, sample_fraction)
+    print(f"   ✓ Learned window size: {win}x{win} pixels")
+    return win
+
+def _learn_window_via_sampling(new_urban_mask, sample_fraction=0.1):
+    pts = np.argwhere(new_urban_mask)
+    if len(pts) == 0:
+        return 51
+    n_samp = max(1000, int(len(pts) * sample_fraction))
+    n_samp = min(n_samp, len(pts))
+    idx = np.random.choice(len(pts), n_samp, replace=False)
+    sampled = pts[idx]
+    radii = [5,10,15,20,25,30,35,40,50]
+    densities = []
+    rows, cols = new_urban_mask.shape
+    for r in radii:
+        dens = []
+        for i in range(min(100, len(sampled))):
+            rr, cc = sampled[i]
+            rmin, rmax = max(0, rr-r), min(rows, rr+r+1)
+            cmin, cmax = max(0, cc-r), min(cols, cc+r+1)
+            region = new_urban_mask[rmin:rmax, cmin:cmax]
+            dens.append(region.sum() / region.size if region.size>0 else 0)
+        densities.append(np.mean(dens))
+    deriv = np.abs(np.diff(densities))
+    stable = np.where(deriv < 0.05)[0]
+    if len(stable) > 0:
+        win = radii[stable[0]] * 2 + 1
+    else:
+        win = 51
+    win = max(11, min(win, 101))
+    if win % 2 == 0:
+        win += 1
+    return win
+
+
+def calculate_spatial_lce(new_urban_mask, pop_2017, pop_2024,
+                          existing_urban, window_size=None):
+    print("\n" + "="*80)
+    print("SPATIAL LCE CALCULATION (USING POPULATION INCREASE)")
+    print("="*80)
+
+    if window_size is None:
+        window_size = learn_window_size_optimized(new_urban_mask, existing_urban)
+
+    kernel = np.ones((window_size, window_size), dtype=np.float32)
+    window_area_ha = (window_size ** 2) * PIXEL_AREA_HA
+    print(f"\n⚙️  Window: {window_size}×{window_size}  ({window_area_ha:.2f} ha)")
+
+    # Local new urban area (ha)
+    local_new_urban = ndimage.convolve(
+        new_urban_mask.astype(np.float32), kernel, mode='constant', cval=0
+    ) * PIXEL_AREA_HA
+
+    # Local existing urban density (fraction)
+    local_urban_density = ndimage.convolve(
+        existing_urban.astype(np.float32), kernel, mode='constant', cval=0
+    ) / (window_size ** 2)
+
+    # Population INCREASE inside new urban pixels
+    pop_in_new_2017 = np.where(new_urban_mask, pop_2017, 0.0)
+    pop_in_new_2024 = np.where(new_urban_mask, pop_2024, 0.0)
+    pop_increase_new = pop_in_new_2024 - pop_in_new_2017
+
+    # Convolved local population increase
+    local_pop_inc = ndimage.convolve(
+        pop_increase_new.astype(np.float32), kernel, mode='constant', cval=0
+    )
+
+    # Diagnostic
+    tot_2024 = np.sum(pop_in_new_2024)
+    tot_inc  = np.sum(pop_increase_new)
+    if tot_inc > 0:
+        print(f"\n⚠️  Denominator check: "
+              f"2024 total={tot_2024:,.0f}, increase={tot_inc:,.0f} "
+              f"(ratio {tot_2024/tot_inc:.2f}x)")
+
+    # Learn threshold for minimal positive population increase
+    pos_inc = pop_increase_new[new_urban_mask & (pop_increase_new > 0)]
+    pop_thresh = np.percentile(pos_inc, 5) if len(pos_inc) > 0 else 0.1
+    print(f"   Population increase threshold (5th pctl): {pop_thresh:.4f}")
+
+    lce_spatial = np.full_like(new_urban_mask, np.nan, dtype=np.float32)
+
+    # Valid: positive increase above threshold & new urban
+    valid = (local_pop_inc > pop_thresh) & new_urban_mask
+    if valid.any():
+        lce_spatial[valid] = local_new_urban[valid] / local_pop_inc[valid]
+        print(f"   ✓ LCE computed for {valid.sum():,} pixels")
+
+    # Inefficient: new urban but population increase ≤ threshold
+    inefficient = new_urban_mask & (local_pop_inc <= pop_thresh)
+    if inefficient.any():
+        max_lce = np.nanmax(lce_spatial) if np.any(~np.isnan(lce_spatial)) else 1.0
+        lce_spatial[inefficient] = max_lce * 2.0
+        print(f"   ⚠️  {inefficient.sum():,} inefficient pixels → assigned {max_lce*2:.4f}")
+
+    # Statistics
+    valid_all = (~np.isnan(lce_spatial)) & new_urban_mask
+    if valid_all.any():
+        vals = lce_spatial[valid_all]
+        print(f"\n📊 LCE stats (ha/person): "
+              f"mean={vals.mean():.6f}, median={np.median(vals):.6f}, "
+              f"range=[{vals.min():.6f}, {vals.max():.6f}]")
+        for p in [10,25,50,75,90,95]:
+            print(f"     {p:2d}th: {np.percentile(vals,p)*10000:8.1f} m²/person")
+
+    return lce_spatial, local_urban_density
+
+
+def calculate_component_weights(lce_spatial, urban_density, new_urban_mask):
+    print("\n" + "="*80)
+    print("COMPONENT WEIGHT CALCULATION")
+    print("="*80)
+    valid = new_urban_mask & (~np.isnan(lce_spatial))
+    if not valid.any():
+        print("   No valid data → equal weights")
+        return {'lce': 0.5, 'density': 0.5}
+
+    cv_lce = variation(lce_spatial[valid][~np.isnan(lce_spatial[valid])])
+    cv_den = variation(urban_density[valid][~np.isnan(urban_density[valid])])
+    inv_sum = 1/cv_lce + 1/cv_den
+    w = {'lce': (1/cv_lce)/inv_sum, 'density': (1/cv_den)/inv_sum}
+    print(f"   CV: LCE={cv_lce:.3f}, Density={cv_den:.3f}")
+    print(f"   Weights: LCE={w['lce']:.1%}, Density={w['density']:.1%}")
+    return w
+
+
+def integrate_components(lce_spatial, urban_density, new_urban_mask, weights):
+    print("\n" + "="*80)
+    print("COMPONENT INTEGRATION (INVERTED SCALE)")
+    print("="*80)
+
+    def norm_robust(arr, invert):
+        valid = new_urban_mask & (~np.isnan(arr))
+        if not valid.any():
+            return np.zeros_like(arr)
+        vals = arr[valid]
+        q1, q3 = np.percentile(vals, 25), np.percentile(vals, 75)
+        iqr = q3 - q1
+        lo = max(np.percentile(vals, 2), q1 - 1.5*iqr)
+        hi = min(np.percentile(vals, 98), q3 + 1.5*iqr)
+        if hi <= lo:
+            out = np.zeros_like(arr)
+            out[valid] = 0.5
+            return 1 - out if invert else out
+        norm = np.zeros_like(arr)
+        norm[valid] = np.clip((arr[valid] - lo) / (hi - lo), 0, 1)
+        if invert:
+            norm = 1 - norm
+        print(f"   {'LCE' if invert else 'Density':15s}: [{lo:.4f}, {hi:.4f}] → [0,1]"
+              f"{' (inverted)' if invert else ''}")
+        return norm
+
+    lce_norm = norm_robust(lce_spatial, invert=True)   # low LCE → high score
+    den_norm = norm_robust(urban_density, invert=False)
+
+    combined = weights['lce']*lce_norm + weights['density']*den_norm
+    final = combined * 100.0
+    masked = np.where(new_urban_mask, final, -9999)
+
+    valid_idx = masked[new_urban_mask]
+    if len(valid_idx) > 0:
+        print(f"\n📊 Final LCE Index (new urban areas):")
+        print(f"   Pixels: {len(valid_idx):,}")
+        print(f"   Mean: {valid_idx.mean():.2f}, Median: {np.median(valid_idx):.2f}, "
+              f"Std: {valid_idx.std():.2f}, Range: [{valid_idx.min():.2f}, {valid_idx.max():.2f}]")
+        # For display only, show 33rd/67th percentiles as descriptive splits
+        lo_th = np.percentile(valid_idx, 33)
+        hi_th = np.percentile(valid_idx, 67)
+        print(f"   Descriptive thresholds: Low ≤{lo_th:.1f} ≤ Medium ≤{hi_th:.1f} ≤ High")
+
+    return masked
+
+
+def calculate_aggregate_metrics(new_urban_mask, pop_2017, pop_2024):
+    print("\n" + "="*80)
+    print("AGGREGATE METRICS")
+    print("="*80)
+    area_ha = new_urban_mask.sum() * PIXEL_AREA_HA
+    pop_17 = pop_2017[new_urban_mask].sum()
+    pop_24 = pop_2024[new_urban_mask].sum()
+    inc = pop_24 - pop_17
+
+    if inc > 0:
+        lce_ha = area_ha / inc
+        lce_m2 = lce_ha * 10000
+    elif inc == 0:
+        lce_ha = np.inf
+        lce_m2 = np.inf
+    else:
+        lce_ha = -area_ha / abs(inc)
+        lce_m2 = lce_ha * 10000
+
+    print(f"   New urban area: {area_ha:,.2f} ha")
+    print(f"   Pop in new areas 2017: {pop_17:,.0f}, 2024: {pop_24:,.0f}, increase: {inc:,.0f}")
+    print(f"   Aggregate LCE: {lce_ha:.4f} ha/person ({lce_m2:.1f} m²/person)")
+    return {
+        'new_urban_area_ha': area_ha,
+        'pop_2017_new': pop_17,
+        'pop_2024_new': pop_24,
+        'pop_increase_new': inc,
+        'aggregate_lce_ha': lce_ha,
+        'aggregate_lce_m2': lce_m2
+    }
+
+def calculate_decoupling_index(urban_2017, urban_2024,
+                               pop_2017, pop_2024,
+                               agg_metrics, city_name="city"):
+    """Compute raw population‑land decoupling rates and index."""
+    print("\n" + "="*80)
+    print("DECOUPLING INDEX (RAW METRICS)")
+    print("="*80)
+
+    # Total population (entire study area)
+    tot_pop_2017 = float(pop_2017.sum())
+    tot_pop_2024 = float(pop_2024.sum())
+    pop_added = tot_pop_2024 - tot_pop_2017
+    pop_growth_rate = ((tot_pop_2024 - tot_pop_2017) / tot_pop_2017) / TIME_PERIOD * 100 \
+                      if tot_pop_2017 > 0 else 0.0
+
+    print(f"   Pop {YEAR_START}: {tot_pop_2017:,.0f}, {YEAR_END}: {tot_pop_2024:,.0f}, "
+          f"added: {pop_added:+,.0f}, rate: {pop_growth_rate:.4f} %/yr")
+
+    # Urban area
+    urban_area_2017_ha = float(urban_2017.sum()) * PIXEL_AREA_HA
+    urban_area_2024_ha = float(urban_2024.sum()) * PIXEL_AREA_HA
+    land_added_ha = urban_area_2024_ha - urban_area_2017_ha
+    land_growth_rate = ((urban_area_2024_ha - urban_area_2017_ha) / urban_area_2017_ha) / TIME_PERIOD * 100 \
+                       if urban_area_2017_ha > 0 else 0.0
+
+    print(f"   Urban area {YEAR_START}: {urban_area_2017_ha:,.2f} ha, "
+          f"{YEAR_END}: {urban_area_2024_ha:,.2f} ha, "
+          f"added: {land_added_ha:+,.2f} ha, rate: {land_growth_rate:.4f} %/yr")
+
+    # Decoupling index
+    if land_growth_rate != 0:
+        decoupling = pop_growth_rate / land_growth_rate
+    else:
+        decoupling = float('inf') if pop_growth_rate > 0 else float('nan')
+
+    print(f"   Decoupling index (pop/land growth): "
+          f"{pop_growth_rate:.4f} / {land_growth_rate:.4f} = {decoupling}")
+
+    return {
+        'city_name':               city_name,
+        'year_start':              YEAR_START,
+        'year_end':                YEAR_END,
+        'time_period_years':       TIME_PERIOD,
+        'total_pop_2017':          round(tot_pop_2017, 0),
+        'total_pop_2024':          round(tot_pop_2024, 0),
+        'pop_added':               round(pop_added, 0),
+        'pop_growth_rate_pct_yr':  round(pop_growth_rate, 6),
+        'urban_area_2017_ha':      round(urban_area_2017_ha, 4),
+        'urban_area_2024_ha':      round(urban_area_2024_ha, 4),
+        'new_urban_area_ha':       round(land_added_ha, 4),
+        'land_growth_rate_pct_yr': round(land_growth_rate, 6),
+        'aggregate_lce_m2_per_person': round(agg_metrics['aggregate_lce_m2'], 4)
+                if not np.isinf(agg_metrics['aggregate_lce_m2']) else 'inf',
+        'decoupling_index':        round(decoupling, 6)
+                if not (np.isinf(decoupling) or np.isnan(decoupling)) else str(decoupling)
+    }
+
+def save_decoupling_result(result, output_dir, city_name):
+    """Save to JSON and append to cross‑city CSV."""
+    json_path = os.path.join(output_dir, f"decoupling_{city_name}.json")
+    with open(json_path, 'w') as f:
+        json.dump(result, f, indent=2)
+    print(f"   ✓ Saved: {os.path.basename(json_path)}")
+
+    csv_path = "cross_city_decoupling_index.csv"
+    file_exists = os.path.isfile(csv_path)
+    with open(csv_path, 'a', newline='') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=list(result.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(result)
+    print(f"   ✓ Appended to: {csv_path}")
+
+
+def main():
+    print("\n" + "="*80)
+    print("LAND CONSUMPTION EFFICIENCY ANALYSIS v5.6 – FULLY DATA‑DRIVEN")
+    print("="*80)
+    print(f"Started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    # CONFIG – set per city
+    CITY_NAME = "city_name_here"   # <-- CHANGE FOR EACH CITY
+
+    base_dir = "/mnt/user-data/uploads" if os.path.exists("/mnt/user-data/uploads/Processed data") else "."
+    lu_2017_path = os.path.join(base_dir, "Processed data/2017.tif")
+    lu_2024_path = os.path.join(base_dir, "Processed data/2024.tif")
+    pop_2017_path = os.path.join(base_dir, "Processed data/pop2017.tif")
+    pop_2024_path = os.path.join(base_dir, "Processed data/Pop2024.tif")
+
+    output_dir = f"LCE_Results_v5.6_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    os.makedirs(output_dir, exist_ok=True)
+    print(f"📁 Output directory: {output_dir}\n")
+
+    # ---- Load land‑use data ----
+    print("LOADING LAND USE DATA")
+    lu_2024_arr, lu_2024_prof, _, _, _ = read_geotiff(lu_2024_path)
+    lu_2017_arr, lu_2017_prof, _, _, _ = read_geotiff(lu_2017_path)
+
+    urban_2017 = extract_urban_mask(lu_2017_arr, "2017")
+    urban_2024 = extract_urban_mask(lu_2024_arr, "2024")
+
+    # ---- Load & clean population data (already aligned) ----
+    print("\nLOADING POPULATION DATA")
+    pop_2017_raw, pop_2017_prof, _, _, _ = read_geotiff(pop_2017_path)
+    pop_2024_raw, pop_2024_prof, _, _, _ = read_geotiff(pop_2024_path)
+
+    # Learn range from the raw (but aligned) arrays
+    pop_min, pop_max = learn_population_range([pop_2017_raw, pop_2024_raw])
+    pop_2017 = clean_population_array(pop_2017_raw, pop_min, pop_max, "2017")
+    pop_2024 = clean_population_array(pop_2024_raw, pop_min, pop_max, "2024")
+
+    # ---- Urban change & aggregate metrics ----
+    urban_data = analyze_urban_changes(urban_2017, urban_2024)
+    agg = calculate_aggregate_metrics(urban_data['new_urban'], pop_2017, pop_2024)
+
+    # ---- Spatial LCE ----
+    lce_spatial, urban_density = calculate_spatial_lce(
+        urban_data['new_urban'], pop_2017, pop_2024,
+        urban_data['urban_2017'], window_size=None
+    )
+
+    # ---- Weights & final index ----
+    weights = calculate_component_weights(lce_spatial, urban_density, urban_data['new_urban'])
+    lce_final = integrate_components(lce_spatial, urban_density, urban_data['new_urban'], weights)
+
+    # Save final LCE raster
+    print("\nSAVING FINAL LCE INDEX")
+    out_raster = os.path.join(output_dir, "land_consumption_efficiency_2017_2024.tif")
+    write_geotiff(out_raster, lce_final, lu_2024_prof, -9999)
+
+    # Compute from the final per‑pixel index (already spatial + components)
+    valid_new = lce_final[urban_data['new_urban']]
+    if len(valid_new) > 0:
+        composite_lce_index = valid_new.mean()          # mean index value
+        composite_lce_aggregate = agg["aggregate_lce_m2"]   # m²/person aggregate
+    else:
+        composite_lce_index = 0.0
+        composite_lce_aggregate = float("inf")
+
+    print("\n" + "="*80)
+    print("FINAL COMPOSITE LCE SCORES (CITY-LEVEL)")
+    print("="*80)
+    print(f"   Composite LCE Index (mean of spatial index): {composite_lce_index:.2f}")
+    print(f"   Aggregate LCE (total new area / total pop increase): "
+          f"{composite_lce_aggregate if not np.isinf(composite_lce_aggregate) else 'inf'} m²/person")
+    print("   (Lower spatial index = less efficient; higher m²/person = less efficient)")
+    print("="*80)
+
+    # ---- Decoupling index ----
+    decoupling = calculate_decoupling_index(
+        urban_2017, urban_2024, pop_2017, pop_2024, agg, city_name=CITY_NAME
+    )
+    print("\nSAVING DECOUPLING METRICS")
+    save_decoupling_result(decoupling, output_dir, CITY_NAME)
+
+    print("\n" + "="*80)
+    print("✅ ANALYSIS COMPLETE")
+    print("="*80)
+    print(f"   LCE raster: {out_raster}")
+    print(f"   Decoupling json/csv: {output_dir}")
+    print(f"   Cross‑city CSV: cross_city_decoupling_index.csv")
+    print(f"\nFinished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
+    main()
