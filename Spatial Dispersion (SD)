@@ -1,0 +1,1162 @@
+import os
+import warnings
+from pathlib import Path
+from datetime import datetime
+import json
+
+import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import rasterio
+from scipy.ndimage import label
+from scipy.spatial import cKDTree
+from scipy.stats import norm, chi2
+
+warnings.filterwarnings("ignore")
+
+
+INPUT_FILE_2017 = "Processed data/2017_cleaned.tif"
+INPUT_FILE_2024 = "Processed data/2024_cleaned.tif"
+OUTPUT_DIRECTORY = "outputs_urban_sprawl_dispersion"
+
+class Config:
+    CELL_SIZE = 10  # meters
+    PIXEL_AREA_M2 = CELL_SIZE ** 2
+
+    # Statistical controls
+    CONFIDENCE_LEVEL = 0.95
+    ALPHA = 1.0 - CONFIDENCE_LEVEL
+
+    # Monte Carlo / permutation budgets
+    N_SIMULATIONS = None  # learned from data
+    MIN_SIMULATIONS = 99
+    MAX_SIMULATIONS = 999  # MODIFIED: increased from 299 to 999
+
+    # Values in output raster
+    OLD_URBAN_VALUE = -1.0
+    NO_DATA_VALUE = -9999.0
+
+    # Final score range expansion (optional)
+    # REVERTED to None – keep pure CDF probabilities
+    FINAL_SCORE_RANGE = None
+
+    # Raster / report behavior
+    EPS = 1e-12
+
+
+
+def empirical_cdf_score(value, samples):
+    """
+    Empirical CDF of value in samples, returns score in [0, 1].
+    Uses a continuity correction so the result is strictly inside (0,1)
+    when samples is non‑empty. Prevents exactly 0 or 1 dispersion scores.
+    """
+    samples = np.asarray(samples, dtype=float)
+    n = samples.size
+    if n == 0:
+        return 0.5
+    count = np.sum(samples <= value) + 0.5
+    return float(count / (n + 1.0))
+
+
+def empirical_two_sided_pvalue(value, samples):
+    samples = np.asarray(samples, dtype=float)
+    n = samples.size
+    if n == 0:
+        return 1.0
+    center = np.median(samples)
+    obs_dev = abs(value - center)
+    null_dev = np.abs(samples - center)
+    count = np.sum(null_dev >= obs_dev) + 0.5
+    p = count / (n + 1.0)
+    return float(np.clip(p, 1.0 / (n + 1.0), 1.0))
+
+
+def safe_clip01(x):
+    return float(np.clip(x, 0.0, 1.0))
+
+
+
+class ParameterLearner:
+    """Learn analysis parameters from the observed data."""
+
+    def learn_parameters(self, new_urban_mask, urban_t0_mask, valid_mask):
+        print("\n" + "=" * 80)
+        print("LEARNING SPATIAL PARAMETERS FROM DATA")
+        print("=" * 80)
+
+        rows, cols = np.where(valid_mask > 0)
+        if len(rows) == 0:
+            return None
+
+        extent_rows = int(np.max(rows) - np.min(rows) + 1)
+        extent_cols = int(np.max(cols) - np.min(cols) + 1)
+        max_extent_pixels = max(extent_rows, extent_cols)
+        max_extent_meters = max_extent_pixels * Config.CELL_SIZE
+
+        print(f"\n   Study area extent: {max_extent_pixels} pixels ({max_extent_meters / 1000:.2f} km)")
+
+        # Ripley's distance range
+        max_distance = max_extent_meters / 2.0
+        n_distances = int(10 + np.log10(max(max_extent_meters, 100.0) / 100.0))
+        n_distances = max(10, min(n_distances, 20))
+        distances = np.linspace(0, max_distance, n_distances)
+
+        print("\n   Ripley's K distance range:")
+        print(f"     Min: {distances[0]:.0f} m")
+        print(f"     Max: {distances[-1]:.0f} m ({distances[-1] / 1000:.2f} km)")
+        print(f"     Bands: {n_distances}")
+
+        # Monte Carlo simulations
+        n_new_urban = int(np.sum(new_urban_mask))
+        n_sims = int(99 + np.log10(n_new_urban + 1) * 20)
+        n_sims = max(Config.MIN_SIMULATIONS, min(n_sims, Config.MAX_SIMULATIONS))
+        Config.N_SIMULATIONS = n_sims
+        print(f"\n   Monte Carlo / permutation simulations: {n_sims}")
+
+        quadrat_size = self._learn_quadrat_size(new_urban_mask)
+        print(f"\n   Quadrat size: {quadrat_size} pixels ({quadrat_size * Config.CELL_SIZE} m)")
+
+        moran_distance = self._learn_moran_distance(new_urban_mask, max_extent_meters)
+        print(f"\n   Moran's I neighborhood scale: {moran_distance:.0f} m ({moran_distance / 1000:.2f} km)")
+
+        return {
+            "distances": distances,
+            "max_distance": max_distance,
+            "quadrat_size": quadrat_size,
+            "moran_distance": moran_distance,
+            "extent_meters": max_extent_meters,
+            "n_simulations": n_sims,
+            "study_area_bounds": {
+                "min_row": int(np.min(rows)),
+                "max_row": int(np.max(rows)),
+                "min_col": int(np.min(cols)),
+                "max_col": int(np.max(cols)),
+            },
+        }
+
+    def _learn_quadrat_size(self, mask):
+        rows, cols = np.where(mask > 0)
+        if len(rows) < 100:
+            return max(10, min(int(np.sqrt(mask.size) / 20), 100))
+
+        n_samples = min(200, len(rows))
+        indices = np.random.choice(len(rows), n_samples, replace=False)
+        sample_rows = rows[indices]
+        sample_cols = cols[indices]
+
+        max_lag = int(np.sqrt(mask.size) / 10)
+        lags = np.linspace(5, min(max_lag, 100), 10, dtype=int)
+        autocorrs = []
+        for lag in lags:
+            corr_sum = 0.0
+            count = 0
+            for i in range(min(100, len(sample_rows))):
+                r, c = sample_rows[i], sample_cols[i]
+                if c + lag < mask.shape[1]:
+                    corr_sum += mask[r, c] * mask[r, c + lag]
+                    count += 1
+            autocorrs.append(corr_sum / count if count > 0 else 0.0)
+        autocorrs = np.array(autocorrs)
+        threshold = np.median(autocorrs) if np.max(autocorrs) > 0 else 0.5
+        below_threshold = np.where(autocorrs < threshold)[0]
+        if len(below_threshold) > 0:
+            quadrat_size = int(lags[below_threshold[0]])
+        else:
+            quadrat_size = int(lags[-1])
+        min_size = max(5, int(np.sqrt(mask.size) / 100))
+        max_size = min(100, int(np.sqrt(mask.size) / 10))
+        quadrat_size = max(min_size, min(quadrat_size, max_size))
+        return quadrat_size
+
+    def _learn_moran_distance(self, mask, max_extent_meters):
+        rows, cols = np.where(mask > 0)
+        if len(rows) < 10:
+            return max_extent_meters / 10.0
+
+        n_samples = min(100, len(rows))
+        indices = np.random.choice(len(rows), n_samples, replace=False)
+        sample_rows = rows[indices]
+        sample_cols = cols[indices]
+        coords_m = np.column_stack([
+            sample_rows * Config.CELL_SIZE,
+            sample_cols * Config.CELL_SIZE
+        ])
+        tree = cKDTree(coords_m)
+        dists, _ = tree.query(coords_m, k=2)
+        mean_nn_distance = np.mean(dists[:, 1])
+        k = min(10, len(coords_m) - 1)
+        dists_k, _ = tree.query(coords_m, k=k + 1)
+        mean_k_distance = np.mean(dists_k[:, 1:])
+        multiplier = max(3.0, min(mean_k_distance / max(mean_nn_distance, Config.EPS), 10.0))
+        moran_distance = mean_nn_distance * multiplier
+        moran_distance = max(moran_distance, 100.0)
+        moran_distance = min(moran_distance, max_extent_meters / 5.0)
+        return moran_distance
+
+
+
+class RipleysKCalculator:
+    def __init__(self, params):
+        self.params = params
+        self.distances = params["distances"]
+
+    def calculate(self, new_urban_mask, valid_mask, valid_area_m2):
+        print("\n" + "=" * 80)
+        print("RIPLEY'S K/L FUNCTION")
+        print("=" * 80)
+
+        centroids = self._get_patch_centroids(new_urban_mask)
+        if centroids is None or len(centroids) < 3:
+            print("   ⚠ Insufficient patches for Ripley analysis")
+            return None
+
+        print(f"\n   Patches detected: {len(centroids)}")
+        print(f"   Distance bands: {len(self.distances)}")
+
+        K_obs, L_obs = self._calculate_K_L(centroids, valid_area_m2)
+
+        K_env, L_env, null_cluster_stats = self._monte_carlo_envelope(
+            len(centroids), valid_area_m2, valid_mask
+        )
+        observed_cluster_stat = np.trapz(L_obs, self.distances)
+
+        dispersion = 1.0 - empirical_cdf_score(observed_cluster_stat, null_cluster_stats)
+        dispersion = safe_clip01(dispersion)
+
+        p_value = empirical_two_sided_pvalue(observed_cluster_stat, null_cluster_stats)
+
+        print("\n   ✓ Ripley's analysis complete")
+        print(f"     Observed cluster statistic: {observed_cluster_stat:.6f}")
+        print(f"     Empirical p-value: {p_value:.4f}")
+        print(f"     Dispersion score: {dispersion:.4f}")
+
+        return {
+            "K_observed": K_obs,
+            "L_observed": L_obs,
+            "K_envelope": K_env,
+            "L_envelope": L_env,
+            "dispersion": dispersion,
+            "p_value": p_value,
+            "observed_stat": observed_cluster_stat,
+            "n_patches": len(centroids),
+            "centroids": centroids,
+        }
+
+    def _get_patch_centroids(self, mask):
+        rows, cols = np.where(mask > 0)
+        if len(rows) == 0:
+            return np.array([])
+        if len(rows) > 1000:
+            idx = np.random.choice(len(rows), 1000, replace=False)
+            rows = rows[idx]
+            cols = cols[idx]
+        centroids = np.column_stack([
+            rows * Config.CELL_SIZE,
+            cols * Config.CELL_SIZE
+        ])
+        return centroids
+
+    def _calculate_K_L(self, centroids, area):
+        n = len(centroids)
+        if n < 3 or area <= 0:
+            return np.zeros(len(self.distances)), np.zeros(len(self.distances))
+        intensity = n / area
+        tree = cKDTree(centroids)
+        K_values = np.zeros(len(self.distances))
+        L_values = np.zeros(len(self.distances))
+        for i, d in enumerate(self.distances):
+            if d <= 0:
+                continue
+            count = 0
+            for j in range(n):
+                indices = tree.query_ball_point(centroids[j], d)
+                count += len(indices) - 1
+            count = count / 2.0
+            K = count / (n * intensity) if intensity > 0 else 0.0
+            L = np.sqrt(max(K, 0.0) / np.pi) - d
+            K_values[i] = K
+            L_values[i] = L
+        return K_values, L_values
+
+    def _monte_carlo_envelope(self, n_points, area, valid_mask):
+        sims = Config.N_SIMULATIONS
+        print(f"   Monte Carlo simulations: {sims}")
+
+        valid_rows, valid_cols = np.where(valid_mask > 0)
+        valid_coords_m = np.column_stack([
+            valid_rows * Config.CELL_SIZE,
+            valid_cols * Config.CELL_SIZE
+        ])
+
+        def sample_random_points(n):
+            idx = np.random.choice(len(valid_coords_m), n, replace=True)
+            return valid_coords_m[idx]
+
+        K_simulations = []
+        L_simulations = []
+        cluster_stats = []
+
+        for sim in range(sims):
+            if sim % max(10, sims // 10) == 0:
+                print(f"     Simulation {sim}/{sims}...", end="\r")
+            random_points = sample_random_points(n_points)
+            K_sim, L_sim = self._calculate_K_L(random_points, area)
+            K_simulations.append(K_sim)
+            L_simulations.append(L_sim)
+            cluster_stats.append(np.trapz(L_sim, self.distances))
+        print()
+
+        K_simulations = np.array(K_simulations)
+        L_simulations = np.array(L_simulations)
+        cluster_stats = np.array(cluster_stats)
+
+        alpha = Config.ALPHA
+        lower_percentile = (alpha / 2.0) * 100.0
+        upper_percentile = (1.0 - alpha / 2.0) * 100.0
+
+        K_env = {
+            "lower": np.percentile(K_simulations, lower_percentile, axis=0),
+            "upper": np.percentile(K_simulations, upper_percentile, axis=0),
+            "mean": np.mean(K_simulations, axis=0),
+        }
+        L_env = {
+            "lower": np.percentile(L_simulations, lower_percentile, axis=0),
+            "upper": np.percentile(L_simulations, upper_percentile, axis=0),
+            "mean": np.mean(L_simulations, axis=0),
+        }
+
+        return K_env, L_env, cluster_stats
+
+
+class MoransICalculator:
+    def __init__(self, params):
+        self.params = params
+        self.quadrat_size = params["quadrat_size"]
+
+    def calculate(self, new_urban_mask, valid_mask):
+        print("\n" + "=" * 80)
+        print("MORAN'S I (QUADRAT-BASED)")
+        print("=" * 80)
+
+        values, pairs = self._prepare_quadrat_values(new_urban_mask, valid_mask)
+        if values is None or len(values) < 5 or len(pairs) == 0:
+            print("   ⚠ Insufficient quadrats for Moran's I")
+            return None
+
+        n = len(values)
+        print(f"\n   Quadrats used: {n}")
+        print(f"   Neighborhood pairs: {len(pairs)}")
+        print(f"   Quadrat size: {self.quadrat_size} px ({self.quadrat_size * Config.CELL_SIZE} m)")
+
+        observed_I = self._moran_i(values, pairs)
+        if observed_I is None:
+            print("   ⚠ Moran's I could not be computed")
+            return None
+
+        perm_count = max(99, min(Config.N_SIMULATIONS or 99, 1000))
+        permuted_I = []
+        for _ in range(perm_count):
+            permuted_values = np.random.permutation(values)
+            permuted_I.append(self._moran_i(permuted_values, pairs))
+        permuted_I = np.array(permuted_I, dtype=float)
+        permuted_I = permuted_I[np.isfinite(permuted_I)]
+
+        expected_I = -1.0 / max(n - 1, 1)
+        p_value = empirical_two_sided_pvalue(observed_I, permuted_I)
+        dispersion = 1.0 - empirical_cdf_score(observed_I, permuted_I)
+        dispersion = safe_clip01(dispersion)
+
+        print(f"\n   Moran's I: {observed_I:.6f}")
+        print(f"   Expected I under CSR: {expected_I:.6f}")
+        print(f"   Empirical p-value: {p_value:.4f}")
+        print(f"   Dispersion score: {dispersion:.4f}")
+
+        return {
+            "observed_I": observed_I,
+            "expected_I": expected_I,
+            "p_value": p_value,
+            "dispersion": dispersion,
+            "permuted_I": permuted_I,
+        }
+
+    def _prepare_quadrat_values(self, new_urban_mask, valid_mask):
+        h, w = new_urban_mask.shape
+        q = self.quadrat_size
+        n_rows = int(np.ceil(h / q))
+        n_cols = int(np.ceil(w / q))
+
+        values = np.full((n_rows, n_cols), np.nan, dtype=float)
+        valid_cells = np.zeros((n_rows, n_cols), dtype=bool)
+
+        for i in range(n_rows):
+            for j in range(n_cols):
+                r0 = i * q
+                r1 = min((i + 1) * q, h)
+                c0 = j * q
+                c1 = min((j + 1) * q, w)
+
+                sub_valid = valid_mask[r0:r1, c0:c1]
+                valid_count = int(np.sum(sub_valid))
+                if valid_count <= 0:
+                    continue
+
+                sub_new = new_urban_mask[r0:r1, c0:c1]
+                urban_count = int(np.sum(sub_new & (sub_valid > 0)))
+                values[i, j] = urban_count / float(valid_count)
+                valid_cells[i, j] = True
+
+        flat_vals = values[valid_cells]
+        if len(flat_vals) < 5:
+            return None, None
+
+        pairs = self._rook_pairs(valid_cells)
+        return flat_vals, pairs
+
+    def _rook_pairs(self, valid_cells):
+        rows, cols = valid_cells.shape
+        index_map = -np.ones((rows, cols), dtype=int)
+        valid_positions = np.argwhere(valid_cells)
+        for idx, (r, c) in enumerate(valid_positions):
+            index_map[r, c] = idx
+
+        pairs = []
+        for r, c in valid_positions:
+            i = index_map[r, c]
+            if r + 1 < rows and valid_cells[r + 1, c]:
+                j = index_map[r + 1, c]
+                pairs.append((i, j))
+            if c + 1 < cols and valid_cells[r, c + 1]:
+                j = index_map[r, c + 1]
+                pairs.append((i, j))
+        return pairs
+
+    def _moran_i(self, x, pairs):
+        x = np.asarray(x, dtype=float)
+        n = len(x)
+        if n < 2:
+            return None
+        x_mean = np.mean(x)
+        den = np.sum((x - x_mean) ** 2)
+        if den <= 0:
+            return None
+        num = 0.0
+        W = 0.0
+        for i, j in pairs:
+            num += (x[i] - x_mean) * (x[j] - x_mean)
+            W += 1.0
+        if W <= 0:
+            return None
+        return float((n / W) * (num / den))
+
+
+
+class NearestNeighborCalculator:
+    def calculate(self, centroids, valid_mask, valid_area_m2):
+        print("\n" + "=" * 80)
+        print("NEAREST NEIGHBOR INDEX (NNI)")
+        print("=" * 80)
+
+        if centroids is None or len(centroids) < 2:
+            print("   ⚠ Insufficient patches")
+            return None
+
+        n = len(centroids)
+        tree = cKDTree(centroids)
+        nn_distances, _ = tree.query(centroids, k=2)
+        nn_distances = nn_distances[:, 1]
+        observed_mean_nn = float(np.mean(nn_distances))
+
+        valid_rows, valid_cols = np.where(valid_mask > 0)
+        valid_coords_m = np.column_stack([
+            valid_rows * Config.CELL_SIZE,
+            valid_cols * Config.CELL_SIZE
+        ])
+
+        n_sims = max(99, min(Config.N_SIMULATIONS or 99, 299))
+        sim_mean_nn = []
+        for _ in range(n_sims):
+            idx = np.random.choice(len(valid_coords_m), n, replace=True)
+            random_points = valid_coords_m[idx]
+            sim_tree = cKDTree(random_points)
+            sim_nn, _ = sim_tree.query(random_points, k=2)
+            sim_mean_nn.append(float(np.mean(sim_nn[:, 1])))
+        sim_mean_nn = np.array(sim_mean_nn)
+
+        dispersion = empirical_cdf_score(observed_mean_nn, sim_mean_nn)
+        dispersion = safe_clip01(dispersion)
+
+        p_value = empirical_two_sided_pvalue(observed_mean_nn, sim_mean_nn)
+
+        print(f"\n   Patches: {n}")
+        print(f"   Observed mean NN distance: {observed_mean_nn:.2f} m")
+        print(f"   Empirical p-value: {p_value:.4f}")
+        print(f"   Dispersion score: {dispersion:.4f}")
+
+        return {
+            "observed_mean_nn": observed_mean_nn,
+            "expected_mean_nn": np.mean(sim_mean_nn),
+            "p_value": p_value,
+            "dispersion": dispersion,
+            "sim_mean_nn": sim_mean_nn,
+        }
+
+
+
+class QuadratAnalysisCalculator:
+    def __init__(self, params):
+        self.quadrat_size = params["quadrat_size"]
+
+    def calculate(self, new_urban_mask, valid_mask):
+        print("\n" + "=" * 80)
+        print("QUADRAT ANALYSIS (VMR – permutation‑based)")
+        print("=" * 80)
+
+        print(f"\n   Quadrat size: {self.quadrat_size} pixels ({self.quadrat_size * Config.CELL_SIZE} m)")
+
+        h, w = new_urban_mask.shape
+        q = self.quadrat_size
+        stride = max(1, q // 2)
+
+        counts = []
+        for i in range(0, h - q + 1, stride):
+            for j in range(0, w - q + 1, stride):
+                sub_new = new_urban_mask[i:i + q, j:j + q]
+                sub_valid = valid_mask[i:i + q, j:j + q]
+                valid_count = int(np.sum(sub_valid))
+                if valid_count <= 0:
+                    continue
+                count = int(np.sum(sub_new & (sub_valid > 0)))
+                counts.append(count)
+        counts = np.array(counts, dtype=float)
+        if len(counts) < 10:
+            print("   ⚠ Insufficient quadrats")
+            return None
+
+        mean_count = float(np.mean(counts))
+        var_count = float(np.var(counts))
+        observed_VMR = var_count / mean_count if mean_count > Config.EPS else 1.0
+
+        N = int(np.sum(new_urban_mask & valid_mask))
+        valid_pixel_index = np.flatnonzero(valid_mask)
+        n_sims = max(99, min(Config.N_SIMULATIONS or 99, 299))
+        sim_VMRs = []
+
+        print(f"   Permutation simulations: {n_sims}")
+        for sim in range(n_sims):
+            if sim % max(10, n_sims // 10) == 0:
+                print(f"     Simulation {sim}/{n_sims}...", end="\r")
+            sim_mask = np.zeros(new_urban_mask.shape, dtype=bool)
+            chosen_idx = np.random.choice(valid_pixel_index, N, replace=True)
+            sim_mask.flat[chosen_idx] = True
+
+            sim_counts = []
+            for i in range(0, h - q + 1, stride):
+                for j in range(0, w - q + 1, stride):
+                    sub_sim = sim_mask[i:i + q, j:j + q]
+                    sub_valid = valid_mask[i:i + q, j:j + q]
+                    if np.any(sub_valid):
+                        sim_counts.append(int(np.sum(sub_sim & (sub_valid > 0))))
+            if len(sim_counts) < 10:
+                continue
+            sim_mean = np.mean(sim_counts)
+            sim_var = np.var(sim_counts)
+            sim_VMRs.append(sim_var / sim_mean if sim_mean > Config.EPS else 1.0)
+        print()
+
+        sim_VMRs = np.array(sim_VMRs)
+        sim_VMRs = sim_VMRs[np.isfinite(sim_VMRs)]
+
+        dispersion = 1.0 - empirical_cdf_score(observed_VMR, sim_VMRs)
+        dispersion = safe_clip01(dispersion)
+
+        p_value = empirical_two_sided_pvalue(observed_VMR, sim_VMRs)
+
+        print(f"\n   Quadrats: {len(counts)}")
+        print(f"   Mean count: {mean_count:.4f}")
+        print(f"   Variance: {var_count:.4f}")
+        print(f"   Observed VMR: {observed_VMR:.6f}")
+        print(f"   Empirical p-value: {p_value:.4f}")
+        print(f"   Dispersion score: {dispersion:.4f}")
+
+        return {
+            "VMR": observed_VMR,
+            "mean_count": mean_count,
+            "variance": var_count,
+            "n_quadrats": len(counts),
+            "dispersion": dispersion,
+            "p_value": p_value,
+        }
+
+
+
+class DispersionIntegrator:
+    def integrate(self, ripley_result, moran_result, nni_result, vmr_result):
+        print("\n" + "=" * 80)
+        print("INTEGRATING DISPERSION METRICS")
+        print("=" * 80)
+
+        metrics = {}
+        pvals = {}
+        if ripley_result is not None:
+            metrics["Ripley_L"] = ripley_result["dispersion"]
+            pvals["Ripley_L"] = ripley_result.get("p_value", 1.0)
+        if moran_result is not None:
+            metrics["Moran_I"] = moran_result["dispersion"]
+            pvals["Moran_I"] = moran_result.get("p_value", 1.0)
+        if nni_result is not None:
+            metrics["NNI"] = nni_result["dispersion"]
+            pvals["NNI"] = nni_result.get("p_value", 1.0)
+        if vmr_result is not None:
+            metrics["VMR"] = vmr_result["dispersion"]
+            pvals["VMR"] = vmr_result.get("p_value", 1.0)
+
+        if len(metrics) == 0:
+            print("   ⚠ No valid metrics")
+            return None
+
+        print(f"\n   Available metrics: {len(metrics)}")
+        for name, val in metrics.items():
+            print(f"     {name:12s}: {val:.4f}")
+
+        values = np.array(list(metrics.values()), dtype=float)
+        pv = np.array([pvals[k] for k in metrics.keys()], dtype=float)
+        confidence = 1.0 - np.clip(pv, 0.0, 1.0)
+        confidence = np.maximum(confidence, 1e-6)
+        weights_array = confidence / np.sum(confidence)
+        final_dispersion = float(np.sum(values * weights_array))
+        final_dispersion = safe_clip01(final_dispersion)
+
+        # No range expansion: pure CDF
+        # (FINAL_SCORE_RANGE remains None, so nothing is applied)
+
+        print("\n   Confidence weights:")
+        for name, wt in zip(metrics.keys(), weights_array):
+            print(f"     {name:12s}: {wt:.4f}")
+        print(f"\n   ✓ Final dispersion: {final_dispersion:.4f}")
+
+        interpretation = self._interpret_dispersion(final_dispersion)
+        print(f"   Interpretation: {interpretation}")
+        return {
+            "dispersion": final_dispersion,
+            "components": metrics,
+            "weights": dict(zip(metrics.keys(), weights_array)),
+            "interpretation": interpretation,
+        }
+
+    def _interpret_dispersion(self, dispersion):
+        if dispersion < 0.5:
+            return "More clustered than dispersed"
+        elif dispersion > 0.5:
+            return "More dispersed than clustered"
+        return "Balanced / near-random"
+
+
+
+class SpatialRasterGenerator:
+    def generate_sprawl_raster(self, new_urban_mask, old_urban_mask, dispersion_global, centroids, params):
+        print("\n" + "=" * 80)
+        print("GENERATING URBAN SPRAWL DISPERSION RASTER")
+        print("=" * 80)
+
+        sd_raster = np.full(new_urban_mask.shape, Config.NO_DATA_VALUE, dtype=np.float32)
+        sd_raster[old_urban_mask > 0] = Config.OLD_URBAN_VALUE
+
+        if centroids is None or len(centroids) < 2:
+            sd_raster[new_urban_mask > 0] = dispersion_global
+            print("   Using uniform dispersion (insufficient patches)")
+        else:
+            centroids_px = centroids / Config.CELL_SIZE
+            tree = cKDTree(centroids_px)
+
+            new_rows, new_cols = np.where(new_urban_mask > 0)
+            total_new = len(new_rows)
+
+            max_points = min(100000, int(10000 + np.log10(total_new + 1) * 10000))
+            if len(new_rows) > max_points:
+                idx = np.random.choice(len(new_rows), max_points, replace=False)
+                sample_rows = new_rows[idx]
+                sample_cols = new_cols[idx]
+                sampled_idx = idx
+            else:
+                sample_rows = new_rows
+                sample_cols = new_cols
+                sampled_idx = np.arange(len(new_rows))
+
+            local_dispersions = []
+            batch_size = max(1000, min(10000, len(sample_rows) // 10))
+
+            print("   Calculating local dispersion...")
+            for start_idx in range(0, len(sample_rows), batch_size):
+                end_idx = min(start_idx + batch_size, len(sample_rows))
+                print(f"     Progress: {start_idx:,}/{len(sample_rows):,}...", end="\r")
+                batch_rows = sample_rows[start_idx:end_idx]
+                batch_cols = sample_cols[start_idx:end_idx]
+
+                for i in range(len(batch_rows)):
+                    point = np.array([batch_rows[i], batch_cols[i]])
+                    k = min(max(2, int(np.log10(len(centroids_px)) + 1)), len(centroids_px))
+                    dists, _ = tree.query(point, k=k)
+                    if np.ndim(dists) > 0 and len(dists) > 1 and np.mean(dists[1:]) > 0:
+                        cv = np.std(dists[1:]) / max(np.mean(dists[1:]), Config.EPS)
+                        local_disp = 1.0 / (1.0 + cv)
+                    else:
+                        local_disp = dispersion_global
+                    local_dispersions.append(local_disp)
+
+            print()
+            local_dispersions = np.array(local_dispersions, dtype=float)
+            if np.std(local_dispersions) > 0:
+                scale_factor = 0.5  # MODIFIED: increased from 0.3 for more local contrast
+                z = (local_dispersions - np.mean(local_dispersions)) / (np.std(local_dispersions) + Config.EPS)
+                local_dispersions = np.clip(dispersion_global + scale_factor * z, 0, 1)
+            else:
+                local_dispersions = np.full_like(local_dispersions, dispersion_global)
+
+            sd_raster[sample_rows, sample_cols] = local_dispersions
+
+            if len(new_rows) > len(sample_rows):
+                print("   Interpolating for remaining pixels...")
+                sample_tree = cKDTree(np.column_stack([sample_rows, sample_cols]))
+                remaining_mask = np.ones(len(new_rows), dtype=bool)
+                remaining_mask[sampled_idx] = False
+                remaining_rows = new_rows[remaining_mask]
+                remaining_cols = new_cols[remaining_mask]
+                for i in range(0, len(remaining_rows), batch_size):
+                    end_idx = min(i + batch_size, len(remaining_rows))
+                    batch_points = np.column_stack([
+                        remaining_rows[i:end_idx],
+                        remaining_cols[i:end_idx]
+                    ])
+                    _, indices_nn = sample_tree.query(batch_points, k=1)
+                    sd_raster[remaining_rows[i:end_idx], remaining_cols[i:end_idx]] = local_dispersions[indices_nn]
+
+        new_urban_stats = sd_raster[new_urban_mask > 0]
+        print(f"\n   Raster statistics:")
+        print(f"     New urban pixels: {len(new_urban_stats):,}")
+        if len(new_urban_stats) > 0:
+            print(f"       Range: [{np.min(new_urban_stats):.4f}, {np.max(new_urban_stats):.4f}]")
+            print(f"       Mean dispersion: {np.mean(new_urban_stats):.4f}")
+
+        return sd_raster
+
+class FigureGenerator:
+    def __init__(self, output_dir):
+        self.output_dir = output_dir
+
+    def generate_all_figures(self, interval_name, ripley_result, moran_result,
+                             nni_result, vmr_result, integration_result, params):
+        print("\n" + "=" * 80)
+        print(f"GENERATING FIGURES FOR {interval_name}")
+        print("=" * 80)
+
+        if ripley_result is not None:
+            self._plot_ripley_L(interval_name, ripley_result, params)
+        self._plot_summary_metrics(interval_name, ripley_result, moran_result,
+                                   nni_result, vmr_result, integration_result)
+        print("\n   ✓ All figures generated")
+
+    def _plot_ripley_L(self, interval_name, ripley_result, params):
+        fig, ax = plt.subplots(figsize=(10, 6))
+        distances = params["distances"] / 1000.0
+        L_obs = ripley_result["L_observed"]
+        L_env = ripley_result["L_envelope"]
+        ax.fill_between(distances, L_env["lower"], L_env["upper"],
+                        alpha=0.3, label=f"{int(Config.CONFIDENCE_LEVEL*100)}% CSR Envelope")
+        ax.plot(distances, L_obs, linewidth=2, label="Observed L(d)")
+        ax.plot(distances, L_env["mean"], linestyle="--", linewidth=1.5, label="CSR Mean")
+        ax.axhline(y=0, color="k", linestyle=":", linewidth=0.8)
+        ax.set_xlabel("Distance (km)", fontsize=12)
+        ax.set_ylabel("L(d)", fontsize=12)
+        ax.set_title(f"Ripley's L Function - {interval_name}", fontsize=14, fontweight="bold")
+        ax.legend(loc="best", fontsize=10)
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        filename = f"ripley_L_{interval_name.replace('-', '_')}.png"
+        plt.savefig(self.output_dir / filename, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"   ✓ Saved: {filename}")
+
+    def _plot_summary_metrics(self, interval_name, ripley_result, moran_result,
+                              nni_result, vmr_result, integration_result):
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+        metrics = []
+        values = []
+        if ripley_result is not None:
+            metrics.append("Ripley"); values.append(ripley_result["dispersion"])
+        if moran_result is not None:
+            metrics.append("Moran"); values.append(moran_result["dispersion"])
+        if nni_result is not None:
+            metrics.append("NNI"); values.append(nni_result["dispersion"])
+        if vmr_result is not None:
+            metrics.append("VMR"); values.append(vmr_result["dispersion"])
+        if integration_result is not None:
+            metrics.append("Integrated"); values.append(integration_result["dispersion"])
+
+        ax1.barh(metrics, values, alpha=0.75, edgecolor="black")
+        ax1.set_xlabel("Dispersion score (0 clustered → 1 dispersed)", fontsize=11)
+        ax1.set_title(f"Dispersion Metrics - {interval_name}", fontsize=13, fontweight="bold")
+        ax1.set_xlim(0, 1)
+        ax1.axvline(x=0.5, linestyle="--", linewidth=1)
+        ax1.grid(True, axis="x", alpha=0.3)
+        for i, val in enumerate(values):
+            ax1.text(val + 0.02, i, f"{val:.3f}", va="center", fontsize=10)
+
+        if integration_result is not None:
+            ax2.text(0.5, 0.65, integration_result["interpretation"],
+                     ha="center", va="center", fontsize=14, fontweight="bold")
+            ax2.text(0.5, 0.45, f"Dispersion: {integration_result['dispersion']:.4f}",
+                     ha="center", va="center", fontsize=12)
+        else:
+            ax2.text(0.5, 0.5, "No integration result", ha="center", va="center", fontsize=12)
+        ax2.set_title("Overall Interpretation", fontsize=13, fontweight="bold")
+        ax2.set_xlim(0, 1); ax2.set_ylim(0, 1); ax2.axis("off")
+        plt.tight_layout()
+        filename = f"dispersion_summary_{interval_name.replace('-', '_')}.png"
+        plt.savefig(self.output_dir / filename, dpi=300, bbox_inches="tight")
+        plt.close()
+        print(f"   ✓ Saved: {filename}")
+
+
+class Exporter:
+    def __init__(self, metadata, output_dir):
+        self.metadata = metadata
+        self.output_dir = output_dir
+
+    def export_raster(self, raster, filename):
+        filepath = self.output_dir / filename
+        meta = {
+            "driver": "GTiff",
+            "dtype": "float32",
+            "count": 1,
+            "height": raster.shape[0],
+            "width": raster.shape[1],
+            "nodata": Config.NO_DATA_VALUE,
+            "compress": "lzw",
+            "transform": self.metadata.get("transform"),
+            "crs": self.metadata.get("crs"),
+        }
+        with rasterio.open(filepath, "w", **meta) as dst:
+            dst.write(raster.astype("float32"), 1)
+        print(f"   ✓ Saved: {filename}")
+
+    def export_report(self, interval_name, results, params):
+        filename = f"urban_sprawl_report_{interval_name.replace('-', '_')}.txt"
+        filepath = self.output_dir / filename
+        with open(filepath, "w") as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"URBAN SPRAWL DISPERSION ANALYSIS REPORT - {interval_name}\n")
+            f.write("=" * 80 + "\n\n")
+            f.write("LEARNED PARAMETERS:\n")
+            f.write(f"  Max distance: {params['max_distance']:.0f} m ({params['max_distance']/1000:.2f} km)\n")
+            f.write(f"  Quadrat size: {params['quadrat_size']} pixels ({params['quadrat_size']*Config.CELL_SIZE} m)\n")
+            f.write(f"  Moran neighborhood: {params['moran_distance']:.0f} m\n")
+            f.write(f"  Simulations: {params['n_simulations']}\n\n")
+
+            if results.get("ripley") is not None:
+                r = results["ripley"]
+                f.write("RIPLEY'S K/L FUNCTION:\n")
+                f.write(f"  Dispersion: {r['dispersion']:.4f}\n")
+                f.write(f"  p-value: {r.get('p_value'):.4f}\n\n")
+
+            if results.get("moran") is not None:
+                m = results["moran"]
+                f.write("MORAN'S I:\n")
+                f.write(f"  Observed I: {m['observed_I']:.6f}\n")
+                f.write(f"  p-value: {m['p_value']:.4f}\n")
+                f.write(f"  Dispersion: {m['dispersion']:.4f}\n\n")
+
+            if results.get("nni") is not None:
+                n = results["nni"]
+                f.write("NEAREST NEIGHBOR INDEX:\n")
+                f.write(f"  Observed mean NN: {n['observed_mean_nn']:.2f} m\n")
+                f.write(f"  Expected mean NN (CSR): {n['expected_mean_nn']:.2f} m\n")
+                f.write(f"  p-value: {n['p_value']:.4f}\n")
+                f.write(f"  Dispersion: {n['dispersion']:.4f}\n\n")
+
+            if results.get("vmr") is not None:
+                v = results["vmr"]
+                f.write("QUADRAT ANALYSIS (VMR):\n")
+                f.write(f"  VMR: {v['VMR']:.6f}\n")
+                f.write(f"  p-value: {v['p_value']:.4f}\n")
+                f.write(f"  Dispersion: {v['dispersion']:.4f}\n\n")
+
+            if results.get("integration") is not None:
+                i = results["integration"]
+                f.write("INTEGRATED DISPERSION:\n")
+                f.write(f"  Final dispersion: {i['dispersion']:.4f}\n")
+                f.write(f"  Interpretation: {i['interpretation']}\n\n")
+                f.write("  Component dispersions:\n")
+                for name, val in i["components"].items():
+                    f.write(f"    {name:12s}: {val:.4f}\n")
+                f.write("\n  Confidence weights:\n")
+                for name, wt in i["weights"].items():
+                    f.write(f"    {name:12s}: {wt:.4f}\n")
+
+            f.write("\nRASTER LEGEND:\n")
+            f.write(f"  {Config.OLD_URBAN_VALUE}: Pre-existing urban areas (2017 baseline)\n")
+            f.write("  0.0 - 1.0: Dispersion of new urban areas (higher = more dispersed)\n")
+            f.write(f"  {Config.NO_DATA_VALUE}: No data / non-urban areas\n")
+        print(f"   ✓ Saved: {filename}")
+
+
+
+class DataLoader:
+    def __init__(self, file_2017, file_2024):
+        self.file_2017 = Path(file_2017)
+        self.file_2024 = Path(file_2024)
+        self.data = {}
+        self.metadata = {}
+
+    def load(self):
+        print("=" * 80)
+        print("LOADING DATA")
+        print("=" * 80)
+
+        if not self.file_2017.exists():
+            raise FileNotFoundError(f"File not found: {self.file_2017}")
+        print(f"  Loading: {self.file_2017}")
+        with rasterio.open(self.file_2017) as src:
+            data_2017 = src.read(1)
+            self.metadata = {
+                "transform": src.transform,
+                "crs": src.crs,
+                "shape": data_2017.shape,
+                "nodata": src.nodata,
+            }
+            valid_2017 = ~(
+                np.isnan(data_2017) | np.isinf(data_2017) |
+                (data_2017 < -1e10) | (data_2017 > 1e10) |
+                (data_2017 == -9999) | (data_2017 == -32767) |
+                ((data_2017 == src.nodata) if src.nodata is not None else False)
+            )
+            urban_2017 = (data_2017 == 1).astype(np.uint8)
+            self.data[2017] = {"raw": data_2017, "urban": urban_2017, "valid_mask": valid_2017.astype(np.uint8)}
+            print(f"  ✓ 2017: {np.sum(urban_2017):,} urban pixels")
+
+        if not self.file_2024.exists():
+            raise FileNotFoundError(f"File not found: {self.file_2024}")
+        print(f"  Loading: {self.file_2024}")
+        with rasterio.open(self.file_2024) as src:
+            data_2024 = src.read(1)
+            valid_2024 = ~(
+                np.isnan(data_2024) | np.isinf(data_2024) |
+                (data_2024 < -1e10) | (data_2024 > 1e10) |
+                (data_2024 == -9999) | (data_2024 == -32767) |
+                ((data_2024 == src.nodata) if src.nodata is not None else False)
+            )
+            urban_2024 = (data_2024 == 1).astype(np.uint8)
+            self.data[2024] = {"raw": data_2024, "urban": urban_2024, "valid_mask": valid_2024.astype(np.uint8)}
+            print(f"  ✓ 2024: {np.sum(urban_2024):,} urban pixels")
+
+        print("\n✓ Data loaded successfully\n")
+        return self.data, self.metadata
+
+
+
+def analyze_urban_sprawl_interval(data, metadata, exporter, fig_gen, interval_name, year_t0, year_t1):
+    print("\n" + "=" * 80)
+    print(f"ANALYZING URBAN SPRAWL: {interval_name}")
+    print("=" * 80)
+
+    urban_t0 = data[year_t0]["urban"]
+    urban_t1 = data[year_t1]["urban"]
+    valid_mask = (data[year_t0]["valid_mask"] & data[year_t1]["valid_mask"]).astype(np.uint8)
+
+    new_urban = (urban_t1 == 1) & (urban_t0 == 0) & (valid_mask > 0)
+    old_urban = (urban_t0 == 1) & (valid_mask > 0)
+
+    print("\n   Urban areas:")
+    print(f"     Pre-existing ({year_t0}): {np.sum(old_urban):,} pixels")
+    print(f"     New growth ({year_t0}-{year_t1}): {np.sum(new_urban):,} pixels")
+    print(f"     Total urban ({year_t1}): {np.sum(urban_t1):,} pixels")
+
+    if np.sum(new_urban) < 10:
+        print("   ⚠ Insufficient new urban growth for analysis")
+        return None
+
+    param_learner = ParameterLearner()
+    params = param_learner.learn_parameters(new_urban, urban_t0, valid_mask)
+    if params is None:
+        print("   ⚠ Could not learn parameters")
+        return None
+
+    valid_pixel_count = int(np.sum(valid_mask > 0))
+    valid_area_m2 = valid_pixel_count * Config.PIXEL_AREA_M2
+    print(f"   Valid study area (pixels): {valid_pixel_count:,}")
+    print(f"   Valid study area (m²): {valid_area_m2:,.0f}")
+
+    results = {}
+
+    # 1. Ripley's K/L
+    ripley_calc = RipleysKCalculator(params)
+    results["ripley"] = ripley_calc.calculate(new_urban, valid_mask, valid_area_m2)
+
+    # 2. Moran's I
+    moran_calc = MoransICalculator(params)
+    results["moran"] = moran_calc.calculate(new_urban, valid_mask)
+
+    # 3. NNI
+    nni_calc = NearestNeighborCalculator()
+    if results["ripley"] is not None and "centroids" in results["ripley"]:
+        results["nni"] = nni_calc.calculate(
+            results["ripley"]["centroids"], valid_mask, valid_area_m2
+        )
+    else:
+        results["nni"] = None
+
+    # 4. Quadrat VMR
+    vmr_calc = QuadratAnalysisCalculator(params)
+    results["vmr"] = vmr_calc.calculate(new_urban, valid_mask)
+
+    # 5. Integrate (pure CDF, no range expansion)
+    integrator = DispersionIntegrator()
+    results["integration"] = integrator.integrate(
+        results["ripley"], results["moran"], results["nni"], results["vmr"]
+    )
+
+    # 6. Spatial raster & export
+    if results["integration"] is not None:
+        raster_gen = SpatialRasterGenerator()
+        centroids = results["ripley"]["centroids"] if results["ripley"] is not None else None
+        sd_raster = raster_gen.generate_sprawl_raster(
+            new_urban_mask=new_urban,
+            old_urban_mask=old_urban,
+            dispersion_global=results["integration"]["dispersion"],
+            centroids=centroids,
+            params=params,
+        )
+
+        raster_filename = f"urban_sprawl_dispersion_{interval_name.replace('-', '_')}.tif"
+        exporter.export_raster(sd_raster, raster_filename)
+        exporter.export_report(interval_name, results, params)
+        fig_gen.generate_all_figures(
+            interval_name,
+            results["ripley"], results["moran"],
+            results["nni"], results["vmr"],
+            results["integration"], params,
+        )
+
+        return {
+            "raster": sd_raster,
+            "dispersion": results["integration"]["dispersion"],
+            "results": results,
+        }
+    return None
+
+
+def main():
+    np.random.seed(42)
+
+    output_dir = Path(OUTPUT_DIRECTORY)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    print("=" * 80)
+    print("URBAN SPRAWL DISPERSION ANALYSIS 2017-2024 (PURE CDF + IMPROVED SAMPLING)")
+    print("=" * 80)
+    print(f"Start: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+
+    try:
+        loader = DataLoader(INPUT_FILE_2017, INPUT_FILE_2024)
+        data, metadata = loader.load()
+
+        exporter = Exporter(metadata, output_dir)
+        fig_gen = FigureGenerator(output_dir)
+
+        intervals = [("2017-2024", 2017, 2024)]
+        results_summary = {}
+
+        for interval_name, year_t0, year_t1 in intervals:
+            result = analyze_urban_sprawl_interval(
+                data, metadata, exporter, fig_gen,
+                interval_name, year_t0, year_t1
+            )
+            if result is not None:
+                results_summary[interval_name] = result["dispersion"]
+                print(f"\n✓ {interval_name} analysis complete")
+                print(f"  Overall dispersion: {result['dispersion']:.4f}")
+            else:
+                print(f"\n⚠ {interval_name} analysis failed or insufficient data")
+
+        if results_summary:
+            print("\n" + "=" * 80)
+            print("URBAN SPRAWL DISPERSION SUMMARY 2017-2024")
+            print("=" * 80)
+
+            summary_file = output_dir / "urban_sprawl_summary.txt"
+            with open(summary_file, "w") as f:
+                f.write("URBAN SPRAWL DISPERSION SUMMARY 2017-2024\n")
+                f.write("=" * 50 + "\n\n")
+                for interval, dispersion in results_summary.items():
+                    f.write(f"  {interval}: {dispersion:.4f}\n")
+                f.write("\nINTERPRETATION:\n")
+                f.write("  0 = clustered, 1 = dispersed\n")
+                f.write("  Scores are empirical CDF-based with continuity correction.\n")
+                f.write(f"  FINAL_SCORE_RANGE = None (pure probabilities, not rescaled).\n")
+                f.write(f"\nALPHA = {Config.ALPHA:.3f} (explicit)\n")
+
+            print("\nSUMMARY OF DISPERSION VALUES:")
+            print("-" * 40)
+            for interval, dispersion in results_summary.items():
+                print(f"  {interval}: {dispersion:.4f}")
+
+            composite_sd = list(results_summary.values())[0]
+            raster_mean = None
+            raster_path = output_dir / "urban_sprawl_dispersion_2017_2024.tif"
+            if raster_path.exists():
+                with rasterio.open(raster_path) as src:
+                    raster = src.read(1)
+                new_urban_mask = (raster >= 0) & (raster != Config.NO_DATA_VALUE) & (raster != Config.OLD_URBAN_VALUE)
+                if np.any(new_urban_mask):
+                    raster_mean = float(np.mean(raster[new_urban_mask]))
+
+            composite_output = {
+                "interval": "2017-2024",
+                "composite_sd_integrated": round(composite_sd, 4),
+                "composite_sd_raster_mean": round(raster_mean, 4) if raster_mean is not None else None,
+                "interpretation": "0=clustered, 1=dispersed (CDF-based)"
+            }
+            composite_json_path = output_dir / "composite_spatial_dispersion_score.json"
+            with open(composite_json_path, "w") as f:
+                json.dump(composite_output, f, indent=2)
+
+            print("\n" + "=" * 60)
+            print("FINAL COMPOSITE SPATIAL DISPERSION (SD) SCORE")
+            print("=" * 60)
+            print(f"  Integrated dispersion (city-level): {composite_output['composite_sd_integrated']}")
+            if composite_output['composite_sd_raster_mean'] is not None:
+                print(f"  Mean spatial dispersion (raster):   {composite_output['composite_sd_raster_mean']}")
+            print(f"  (0 = clustered, 1 = dispersed)")
+            print(f"\n  Saved to: {composite_json_path}")
+            print("=" * 60)
+
+        print("\n" + "=" * 80)
+        print("✓ URBAN SPRAWL DISPERSION ANALYSIS COMPLETE")
+        print("=" * 80)
+        print(f"\nOutput directory: {output_dir.absolute()}")
+        print("\nOUTPUTS:")
+        print("  ✓ Urban sprawl dispersion rasters (GeoTIFF)")
+        print("  ✓ Comprehensive analysis reports")
+        print("  ✓ Publication-ready figures")
+        print("  ✓ Summary report")
+        print("  ✓ Composite spatial dispersion score (JSON)")
+        print("\nRASTER VALUES:")
+        print(f"  {Config.OLD_URBAN_VALUE}: Pre-existing urban (2017 baseline)")
+        print("  0.0 - 1.0: New urban dispersion (0=clustered, 1=dispersed)")
+        print(f"  {Config.NO_DATA_VALUE}: No data / non-urban")
+        print(f"\nALPHA (explicit): {Config.ALPHA:.3f}")
+
+        print(f"\n{'=' * 80}")
+        print(f"End: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+
+    except Exception as e:
+        print(f"\n❌ ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    main()
